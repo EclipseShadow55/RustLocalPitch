@@ -145,10 +145,10 @@ pub fn two_way_mismatch(frame_context: FrameContext,
         .map(|(i, _)| i)
         .collect();
     let mut measured_bins = n_peaks(frame_data, measured_peaks);
-    if measured_bins.len() == 0 {
+    if measured_bins.is_empty() {
         return Err(ErrorTypes::StandardError);
     }
-    measured_bins.sort_unstable_by(|a, b| a.cmp(b));
+    measured_bins.sort_unstable();
     let measured_bins = measured_bins;
 
 
@@ -198,7 +198,7 @@ pub fn two_way_mismatch(frame_context: FrameContext,
                 .collect();
 
             let mp_total_errors: Vec<f32> = mp_freq_errors.iter()
-                .map(|&(peak_ind, harm_ind, freq_error)| {
+                .map(|&(peak_ind, _, freq_error)| {
                     let freq_base = freq_error * bins[peak_ind].powf(-freq_penalty);
                     let amp_mult = frame_data[peak_ind] / max_amp;
                     let freq_term = amp_weight + freq_weight * (freq_error / bins[peak_ind]);
@@ -233,7 +233,7 @@ fn n_peaks<T: PartialOrd + Clone>(slice: &[T], n:usize) -> Vec<usize> {
 
     for (i, window) in slice.windows(3).enumerate() {
         if window[0] < window[1] && window[1] > window[2] {
-            let pos = largest.binary_search_by(|(ind, v)| {
+            let pos = largest.binary_search_by(|(_, v)| {
                 v.partial_cmp(&window[1])
                     .map(|s| s.reverse())
                     .unwrap_or(std::cmp::Ordering::Equal)

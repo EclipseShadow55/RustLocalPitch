@@ -9,6 +9,7 @@ use std::{
     thread::{JoinHandle},
     error,
     ops::{Bound, RangeBounds},
+    f32::consts as f32consts
 };
 use num_traits::{Num, Zero};
 use crossterm::{
@@ -43,7 +44,8 @@ use analysis::{
         ErrorTypes,
         FrameContext,
         sub_harmonic_summing,
-        peak_picking
+        peak_picking,
+        two_way_mismatch,
     }
 };
 
@@ -425,10 +427,12 @@ static DETECT_METHODS: &[&str] = &{[
     "Sub-Harmonic Summing (Default)",
     "Peak Picking",
     "Two-Way Mismatch",
+]};
+/*
     "Spectral Autocorrelation",
     "Comb Distance",
     "Template Matching",
-]};
+*/
 
 
 fn main() -> Result<(), Box<dyn error::Error>> {
@@ -464,11 +468,24 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
     let (_device, audio_stream, out_post, handle) = setup_audio_callback(min_freq.get(), max_freq.get(), 12, in_post, BufferSize::Fixed(512))?;
 
-    // Filter Parameter
-    let mut str_filter = {
-        LinearParam::new(
-            0.005,
-            0.001)
+    // Volume Parameters
+    let mut vol_filter = {
+        BoundedParam::new(
+            LinearParam::new(
+                0.005f32,
+                0.001),
+            Bound::Included(0.0),
+            Bound::Unbounded
+        )
+    };
+    let mut vol_steepness = {
+        BoundedParam::new(
+            LinearParam::new(
+                2,
+                1),
+            Bound::Excluded(1),
+            Bound::Unbounded
+        )
     };
 
     // Detection Parameters
@@ -509,9 +526,52 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             Bound::Excluded(1.0)
         )
     };
+    let mut twm_predicted_harms = { // 8 - 15; changes max detected frequency
+        BoundedParam::new(
+            LinearParam::new(10usize, 1),
+            Bound::Included(3),
+            Bound::Included(20),
+        )
+    };
+    let mut twm_measured_peaks = { // 8 - 15
+        BoundedParam::new(
+            LinearParam::new(10usize, 1),
+            Bound::Included(2),
+            Bound::Included(20),
+        )
+    };
+    let mut twm_freq_penalty = { // 0.25 - 0.75
+        BoundedParam::new(
+            LinearParam::new(0.5f32, 0.05),
+            Bound::Included(0.0),
+            Bound::Included(2.0),
+        )
+    };
+    let mut twm_amp_weight = { // 0.05 - 0.20
+        BoundedParam::new(
+            ExponentialParam::new(0.1f32, 2.0),
+            Bound::Included(0.0625),
+            Bound::Unbounded,
+        )
+    };
+    let mut twm_freq_weight = { // 0.2 - 0.8
+        BoundedParam::new(
+            ExponentialParam::new(0.4f32, 2.0),
+            Bound::Included(0.0625),
+            Bound::Unbounded,
+        )
+    };
+    let mut twm_error_ratio = { // 0.2 - 0.6
+        BoundedParam::new(
+            LinearParam::new(0.5f32, 0.05),
+            Bound::Included(0.0),
+            Bound::Included(1.0)
+        )
+    };
 
     let mut current_note: String = normalize_disp_str(NO_NOTE_DISP);
     let mut last_note = Instant::now();
+    let mut last_vol: f32 = 0.0;
 
     let mut selected = "None";
     let mut cursor_position: (usize, usize) = (0, 0);
@@ -524,25 +584,42 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         while let Ok(msg) = in_mail.try_recv() {
             match msg {
                 OutputMessage::NewFreqFrame(frame_data) => {
-                    let max_str = *frame_data.iter()
+                    last_vol = *frame_data.iter()
                         .max_by(|a, b| a.total_cmp(b)).unwrap();
 
                     let mut max_ind: Result<usize, usize> = Err(0);
 
-                    if max_str > str_filter.get() {
+                    if last_vol > vol_filter.get() {
                         let frame_context = FrameContext {
                             frame_data: &frame_data,
                             bins: &bins,
                             bins_per_octave: 12,
                         };
                         if detect_mode == 0 {
-                            match sub_harmonic_summing(frame_context, shs_num_harmonics.get(), shs_harmonic_decay.get(), shs_comp_turn_point.get(), shs_favor_low.get(), shs_peak_threshold.get()) {
+                            match sub_harmonic_summing(frame_context,
+                                                       shs_num_harmonics.get(),
+                                                       shs_harmonic_decay.get(),
+                                                       shs_comp_turn_point.get(),
+                                                       shs_favor_low.get(),
+                                                       shs_peak_threshold.get()) {
                                 Ok(max_index) => max_ind = Ok(max_index),
                                 Err(ErrorTypes::BreakError(desc)) => Err(desc)?,
                                 Err(ErrorTypes::StandardError) => max_ind = Err(0),
                             }
                         } else if detect_mode == 1 {
                             match peak_picking(frame_context) {
+                                Ok(max_index) => max_ind = Ok(max_index),
+                                Err(ErrorTypes::BreakError(desc)) => Err(desc)?,
+                                Err(ErrorTypes::StandardError) => max_ind = Err(0),
+                            }
+                        } else if detect_mode == 2 {
+                            match two_way_mismatch(frame_context,
+                                                   twm_predicted_harms.get(),
+                                                   twm_measured_peaks.get(),
+                                                   twm_freq_penalty.get(),
+                                                   twm_amp_weight.get(),
+                                                   twm_freq_weight.get(),
+                                                   twm_error_ratio.get()) {
                                 Ok(max_index) => max_ind = Ok(max_index),
                                 Err(ErrorTypes::BreakError(desc)) => Err(desc)?,
                                 Err(ErrorTypes::StandardError) => max_ind = Err(0),
@@ -558,8 +635,12 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                                     Err((_, desc)) => Err(desc)?
                                 }
                             },
-                            Err(0) => current_note = normalize_disp_str(NO_NOTE_DISP),
-                            Err(_) => current_note = normalize_disp_str(ERROR_DISP),
+                            Err(0) => {
+                                current_note = normalize_disp_str(NO_NOTE_DISP)
+                            },
+                            Err(_) => {
+                                current_note = normalize_disp_str(ERROR_DISP)
+                            },
                         };
                         last_note = Instant::now();
                     }
@@ -594,7 +675,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
             let main_app_height = 35;
             let left_sidebar_width = 35;
-            let main_width = 81;
+            let pitch_display_width = 81;
+            let vol_display_width = 10;
             let right_sidebar_width = 35;
 
             let [vertical_center] = {
@@ -603,59 +685,62 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                     .areas(screen_area)
             };
 
-            let [left_sidebar_area, _spacer1, main_display_area, _spacer2, right_sidebar_area] = {
+            let [left_sidebar_area, _spacer1, pitch_display_area, _spacer2, vol_display_area, _spacer3, right_sidebar_area] = {
                 Layout::horizontal([
                     Constraint::Length(left_sidebar_width),
                     Constraint::Length(2),
-                    Constraint::Length(main_width),
+                    Constraint::Length(pitch_display_width),
+                    Constraint::Length(2),
+                    Constraint::Length(vol_display_width),
                     Constraint::Length(2),
                     Constraint::Length(right_sidebar_width)
                 ]).flex(Flex::Center)
                     .areas(vertical_center)
             };
 
-            // Render Pitch Detector
-            let [main_border1_box] = Layout::horizontal([Constraint::Length(main_width)]).areas(main_display_area);
-            let main_border1_block = {
+            // Render Pitch Display
+            let pitch_display_block1 = {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
                     .title(" Pitch Detector ")
             };
-
-            let main_border2_area = main_border1_block.inner(main_border1_box);
-            let main_border2_block = {
+            let pitch_display_block2 = {
                 Block::default()
                     .borders(Borders::LEFT | Borders::RIGHT)
                     .border_type(BorderType::QuadrantOutside)
                     .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
             };
 
-            let main_content_area = main_border2_block.inner(main_border2_area);
-            let content_height = current_note.lines().count() as u16;
-            let content_width = current_note.lines().next().map_or(0, |line| line.chars().count()) as u16;
-            let [main_content_vertical] = {
-                Layout::vertical([Constraint::Length(content_height)])
+            let pitch_display_block2_area = pitch_display_block1.inner(pitch_display_area);
+            let pitch_display_content_area = pitch_display_block2.inner(pitch_display_block2_area);
+
+            let pitch_display_content_height = current_note.lines().count() as u16;
+            let pitch_display_content_width = current_note.lines().next().map_or(0, |line| line.chars().count()) as u16;
+
+            let [pitch_display_content_vertical] = {
+                Layout::vertical([Constraint::Length(pitch_display_content_height)])
                     .flex(Flex::Center)
-                    .areas(main_content_area)
+                    .areas(pitch_display_content_area)
             };
-            let [main_content_horizontal] = {
-                Layout::horizontal([Constraint::Length(content_width)])
+            let [pitch_display_content_horizontal] = {
+                Layout::horizontal([Constraint::Length(pitch_display_content_width)])
                     .flex(Flex::Center)
-                    .areas(main_content_vertical)
+                    .areas(pitch_display_content_vertical)
             };
-            let mut main_content_widget = Paragraph::new(format!("{}", current_note)).alignment(Alignment::Center);
+
+            let mut pitch_display_content_widget = Paragraph::new(format!("{}", current_note)).alignment(Alignment::Center);
             if current_note == no_note_ref {
-                main_content_widget = main_content_widget.style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+                pitch_display_content_widget = pitch_display_content_widget.style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
             } else {
-                main_content_widget = main_content_widget.style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+                pitch_display_content_widget = pitch_display_content_widget.style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
             }
 
-            frame.render_widget(main_border1_block, main_border1_box);
-            frame.render_widget(main_border2_block, main_border2_area);
+            frame.render_widget(pitch_display_block1, pitch_display_area);
+            frame.render_widget(pitch_display_block2, pitch_display_block2_area);
 
-            frame.render_widget(main_content_widget, main_content_horizontal);
+            frame.render_widget(pitch_display_content_widget, pitch_display_content_horizontal);
 
             // Render Left Sidebar
             let lsb_min_freq_widget = {
@@ -681,7 +766,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         .border_type(BorderType::QuadrantOutside))
             };
             let lsb_str_filter_widget = {
-                Paragraph::new(format!("{}", str_filter.get()))
+                Paragraph::new(format!("{}", vol_filter.get()))
                     .style(Style::default()
                         .fg(Color::Blue)
                         .add_modifier(Modifier::BOLD))
@@ -702,8 +787,19 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         .borders(Borders::LEFT | Borders::RIGHT)
                         .border_type(BorderType::QuadrantOutside))
             };
+            let lsb_vol_steepness_widget = {
+                Paragraph::new(format!("{}", vol_steepness.get()))
+                    .style(Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD))
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default()
+                        .borders(Borders::LEFT | Borders::RIGHT)
+                        .border_type(BorderType::QuadrantOutside))
+            };
 
-            let [lsb_min_freq_area, _lsb_spacer1, lsb_max_freq_area, _lsb_spacer2, lsb_str_filer_area, _lsb_spacer3, lsb_detect_mode_area] = {
+            let [lsb_min_freq_area, _lsb_spacer1, lsb_max_freq_area, _lsb_spacer2, lsb_str_filer_area, _lsb_spacer3, lsb_detect_mode_area, _lsb_spacer4, lsb_vol_steepness_area] = {
                 Layout::vertical([
                     Constraint::Length((lsb_min_freq_widget.line_count(left_sidebar_width - 2) + 2) as u16),
                     Constraint::Length(1),
@@ -712,6 +808,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                     Constraint::Length((lsb_str_filter_widget.line_count(left_sidebar_width - 2) + 2) as u16),
                     Constraint::Length(1),
                     Constraint::Length((lsb_detect_mode_widget.line_count(left_sidebar_width - 2) + 2) as u16),
+                    Constraint::Length(1),
+                    Constraint::Length((lsb_vol_steepness_widget.line_count(left_sidebar_width - 2) + 2) as u16),
                 ]).flex(Flex::Start)
                     .areas(left_sidebar_area)
             };
@@ -744,21 +842,54 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                     .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
                     .title(" Detection Mode ")
             };
+            let lsb_vol_steepness_border_block = {
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                    .title(" Volume Steepness ")
+            };
 
             let lsb_min_freq_content_area = lsb_min_freq_border_block.inner(lsb_min_freq_area);
             let lsb_max_freq_content_area = lsb_max_freq_border_block.inner(lsb_max_freq_area);
             let lsb_str_filter_content_area = lsb_str_filter_border_block.inner(lsb_str_filer_area);
             let lsb_detect_mode_content_area = lsb_detect_mode_border_block.inner(lsb_detect_mode_area);
+            let lsb_vol_steepness_content_area = lsb_vol_steepness_border_block.inner(lsb_vol_steepness_area);
 
             frame.render_widget(lsb_min_freq_border_block, lsb_min_freq_area);
             frame.render_widget(lsb_max_freq_border_block, lsb_max_freq_area);
             frame.render_widget(lsb_str_filter_border_block, lsb_str_filer_area);
             frame.render_widget(lsb_detect_mode_border_block, lsb_detect_mode_area);
+            frame.render_widget(lsb_vol_steepness_border_block, lsb_vol_steepness_area);
 
             frame.render_widget(lsb_min_freq_widget, lsb_min_freq_content_area);
             frame.render_widget(lsb_max_freq_widget, lsb_max_freq_content_area);
             frame.render_widget(lsb_str_filter_widget, lsb_str_filter_content_area);
             frame.render_widget(lsb_detect_mode_widget, lsb_detect_mode_content_area);
+            frame.render_widget(lsb_vol_steepness_widget, lsb_vol_steepness_content_area);
+
+            // Render Volume Display
+            let vol_display_block = {
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                    .title(" Volume ")
+            };
+            let vol_display_widget = {
+                Paragraph::new(create_bar(normalize(last_vol, vol_filter.get(), vol_steepness.get()),
+                                          (vol_display_width - 4) as usize,
+                                          (main_app_height - 2) as usize))
+                    .block(Block::default()
+                        .borders(Borders::LEFT | Borders::RIGHT)
+                        .border_type(BorderType::QuadrantOutside)
+                        .border_style(Style::default().fg(Color::Blue).bg(Color::Green)))
+            };
+
+            let vol_display_content_area = vol_display_block.inner(vol_display_area);
+
+            frame.render_widget(vol_display_block, vol_display_area);
+            frame.render_widget(vol_display_widget, vol_display_content_area);
 
             // Render Right Sidebar
             if detect_mode == 0 {
@@ -889,6 +1020,155 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 frame.render_widget(rsb_peak_threshold_widget, rsb_peak_threshold_content_area);
             } else if detect_mode == 1 {
                 // Peak Picking
+            } else if detect_mode == 2 {
+                // Two-Way Mismatch
+                let rsb_predicted_harms_widget = {
+                    Paragraph::new(format!("{}", twm_predicted_harms.get()))
+                        .style(Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD))
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default()
+                            .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::QuadrantOutside))
+                };
+                let rsb_measured_peaks_widget = {
+                    Paragraph::new(format!("{}", twm_measured_peaks.get()))
+                        .style(Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD))
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default()
+                            .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::QuadrantOutside))
+                };
+                let rsb_freq_penalty_widget = {
+                    Paragraph::new(format!("{}", twm_freq_penalty.get()))
+                        .style(Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD))
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default()
+                            .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::QuadrantOutside))
+                };
+                let rsb_amp_weight_widget = {
+                    Paragraph::new(format!("{}", twm_amp_weight.get()))
+                        .style(Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD))
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default()
+                            .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::QuadrantOutside))
+                };
+                let rsb_freq_weight_widget = {
+                    Paragraph::new(format!("{}", twm_freq_weight.get()))
+                        .style(Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD))
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default()
+                            .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::QuadrantOutside))
+                };
+                let rsb_error_ratio_widget = {
+                    Paragraph::new(format!("{}", twm_error_ratio.get()))
+                        .style(Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD))
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default()
+                            .borders(Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::QuadrantOutside))
+                };
+
+                let [rsb_predicted_harms_area, _rsb_spacer1, rsb_measured_peaks_area, _rsb_spacer2, rsb_freq_penalty_area, _rsb_spacer3, rsb_amp_weight_area, _rsb_spacer4, rsb_freq_weight_area, _rsb_space5, rsb_error_ratio_area] = {
+                    Layout::vertical([
+                        Constraint::Length((rsb_predicted_harms_widget.line_count(right_sidebar_width - 2) + 2) as u16),
+                        Constraint::Length(1),
+                        Constraint::Length((rsb_measured_peaks_widget.line_count(right_sidebar_width - 2) + 2) as u16),
+                        Constraint::Length(1),
+                        Constraint::Length((rsb_freq_penalty_widget.line_count(right_sidebar_width - 2) + 2) as u16),
+                        Constraint::Length(1),
+                        Constraint::Length((rsb_amp_weight_widget.line_count(right_sidebar_width - 2) + 2) as u16),
+                        Constraint::Length(1),
+                        Constraint::Length((rsb_freq_weight_widget.line_count(right_sidebar_width - 2) + 2) as u16),
+                        Constraint::Length(1),
+                        Constraint::Length((rsb_error_ratio_widget.line_count(right_sidebar_width - 2) + 2) as u16),
+                    ]).flex(Flex::Start)
+                        .areas(right_sidebar_area)
+                };
+
+                let rsb_predicted_harms_block = {
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
+                        .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                        .title(" Predicted Harmonics ")
+                };
+                let rsb_measured_peaks_block = {
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
+                        .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                        .title(" Measured Peaks ")
+                };
+                let rsb_freq_penalty_block = {
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
+                        .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                        .title(" Frequency Penalty ")
+                };
+                let rsb_amp_weight_block = {
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
+                        .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                        .title(" Amplitude Weight ")
+                };
+                let rsb_freq_weight_block = {
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
+                        .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                        .title(" Frequency Weight ")
+                };
+                let rsb_error_ratio_block = {
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
+                        .border_style(Style::default().fg(Color::Blue).bg(Color::Green))
+                        .title(" Error Ratio ")
+                };
+
+                let rsb_predicted_harms_content_area = rsb_predicted_harms_block.inner(rsb_predicted_harms_area);
+                let rsb_measured_peaks_content_area = rsb_measured_peaks_block.inner(rsb_measured_peaks_area);
+                let rsb_freq_penalty_content_area = rsb_freq_penalty_block.inner(rsb_freq_penalty_area);
+                let rsb_amp_weight_content_area = rsb_amp_weight_block.inner(rsb_amp_weight_area);
+                let rsb_freq_weight_content_area = rsb_freq_weight_block.inner(rsb_freq_weight_area);
+                let rsb_error_ratio_content_area = rsb_error_ratio_block.inner(rsb_error_ratio_area);
+
+                frame.render_widget(rsb_predicted_harms_block, rsb_predicted_harms_area);
+                frame.render_widget(rsb_measured_peaks_block, rsb_measured_peaks_area);
+                frame.render_widget(rsb_freq_penalty_block, rsb_freq_penalty_area);
+                frame.render_widget(rsb_amp_weight_block, rsb_amp_weight_area);
+                frame.render_widget(rsb_freq_weight_block, rsb_freq_weight_area);
+                frame.render_widget(rsb_error_ratio_block, rsb_error_ratio_area);
+
+                frame.render_widget(rsb_predicted_harms_widget, rsb_predicted_harms_content_area);
+                frame.render_widget(rsb_measured_peaks_widget, rsb_measured_peaks_content_area);
+                frame.render_widget(rsb_freq_penalty_widget, rsb_freq_penalty_content_area);
+                frame.render_widget(rsb_amp_weight_widget, rsb_amp_weight_content_area);
+                frame.render_widget(rsb_freq_weight_widget, rsb_freq_weight_content_area);
+                frame.render_widget(rsb_error_ratio_widget, rsb_error_ratio_content_area);
             }
         })?;
 
@@ -918,13 +1198,17 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         }
                     }
                     KeyCode::Char('w') => {
-                        str_filter.set(str_filter.shift_up());
+                        if let Ok(new_vol_filter) = vol_filter.shift_up() {
+                            vol_filter.set(new_vol_filter);
+                        }
                     }
                     KeyCode::Char('s') => {
-                        str_filter.set(str_filter.shift_down());
+                        if let Ok(new_vol_filter) = vol_filter.shift_down() {
+                            vol_filter.set(new_vol_filter);
+                        }
                     }
                     KeyCode::Char('r') => {
-                        str_filter.set(str_filter.default());
+                        vol_filter.set(vol_filter.default());
 
                         let new_min = min_freq.default();
                         let new_max = max_freq.default();
@@ -965,6 +1249,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
     Ok(())
 }
+
 
 fn setup_audio_callback(min_f: f32, max_f: f32, bins_per_octave: u32, in_post: Sender<OutputMessage>, buffer_size: BufferSize) -> Result<(Device, Stream, Sender<AudioMessage>, JoinHandle<Result<(), String>>), Box<dyn error::Error>> {
     let (device, config) = device_setup()?;
@@ -1090,4 +1375,42 @@ fn freq_to_inds(freq: f32) -> Result<(usize, usize), (bool, String)> {
     }
 
     Err((true, String::from("Number too High to Match")))
+}
+
+fn create_bar(level: f32, width: usize, height: usize) -> Vec<Line<'static>> {
+    let blocks = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let total_steps = height * 8;
+    let full_steps = (level.clamp(0.0, 1.0) * total_steps as f32).round() as usize;
+
+    let full_blocks = full_steps / 8;
+    let last_block = full_steps % 8;
+
+    let mut lines = Vec::new();
+
+    for row in (0..height).rev() {
+        let new_block = if row < full_blocks {
+            blocks[8].repeat(width)
+        } else if row == full_blocks {
+            blocks[last_block].repeat(width)
+        } else {
+            blocks[0].repeat(width)
+        };
+
+        let color = if row >= height / 2 {
+            Color::Green
+        } else if row >= height / 4 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+
+        lines.push(Line::from(Span::styled(new_block, Style::default().fg(color))));
+    }
+
+    lines
+}
+
+#[inline(always)]
+fn normalize(input: f32, midpoint: f32, curve: u16) -> f32 {
+    input.max(0.0).powf(curve as f32) / (midpoint.powf(curve as f32) + input.max(0.0).powf(curve as f32))
 }
