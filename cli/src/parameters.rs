@@ -1,21 +1,7 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering};
 use std::collections::Bound;
 use std::ops::RangeBounds;
 use num_traits::Num;
-
-#[inline(always)]
-fn euclid_rem<T>(a: T, b: T) -> T where T: ParamType {
-    let mut ret = a % b;
-    if ret < T::zero() {
-        if b < T::zero() {
-            ret = ret + b
-        } else {
-            ret = ret - b
-        }
-    }
-
-    ret
-}
 
 trait CheckBounds<T> where T: PartialOrd {
     fn check_bounds(&self, val: T) -> bool;
@@ -27,15 +13,25 @@ pub trait Parameter<T>: PartialOrd<T> + PartialEq<T> where T: PartialOrd + Parti
     fn set(&mut self, val: T);
     fn shift_up_bounded(&self, maximum: T) -> Result<T, ()> {
         if self.shift_up() > maximum {
-            return Err(());
+            if self.get() != maximum {
+                Ok(maximum)
+            } else {
+                Err(())
+            }
+        } else {
+            Ok(self.shift_up())
         }
-        Ok(self.shift_up())
     }
     fn shift_down_bounded(&self, minimum: T) -> Result<T, ()> {
         if self.shift_down() < minimum {
-            return Err(());
+            if self.get() != minimum {
+                Ok(minimum)
+            } else {
+                Err(())
+            }
+        } else {
+            Ok(self.shift_down())
         }
-        Ok(self.shift_down())
     }
     fn get(&self) -> T;
     fn default(&self) -> T;
@@ -47,9 +43,11 @@ pub trait BoundedParameter<T> {
     fn set(&mut self, val: T);
     fn get(&self) -> T;
     fn default(&self) -> T;
+    fn lower_bound(&self) -> Bound<T>;
+    fn upper_bound(&self) -> Bound<T>;
 }
 
-trait ParamType: Copy + Num + PartialOrd {}
+pub trait ParamType: Copy + Num + PartialOrd {}
 
 impl<T> ParamType for T where T: Copy + Num + PartialOrd {}
 
@@ -242,10 +240,18 @@ impl<T> PartialOrd<T> for CyclicParam<T> where T: ParamType {
 
 impl<T> Parameter<T> for CyclicParam<T> where T: ParamType {
     fn shift_up(&self) -> T {
-        self.bottom + euclid_rem(self.current - self.bottom + self.shift, self.span)
+        if self.top - self.current <= self.shift {
+            self.bottom + (self.shift - (self.top - self.current))
+        } else {
+            self.current + self.shift
+        }
     }
     fn shift_down(&self) -> T {
-        self.bottom + euclid_rem(self.current - self.bottom - self.shift, self.span)
+        if self.current - self.bottom < self.shift {
+            self.top - (self.shift - (self.current - self.bottom))
+        } else {
+            self.current - self.shift
+        }
     }
     fn set(&mut self, val: T) {
         self.current = val;
@@ -326,16 +332,16 @@ impl Parameter<bool> for BoolParam {
 
 pub struct BoundedParam<C, T> where C: Parameter<T>, T: ParamType {
     inner: C,
-    upper_bound: Bound<T>,
     lower_bound: Bound<T>,
+    upper_bound: Bound<T>,
 }
 
 impl<C, T> BoundedParam<C, T> where C: Parameter<T>, T: ParamType {
-    pub fn new(inner: C, upper_bound: Bound<T>, lower_bound: Bound<T>) -> Self {
+    pub fn new(inner: C, lower_bound: Bound<T>, upper_bound: Bound<T>) -> Self {
         Self {
             inner,
-            upper_bound,
-            lower_bound
+            lower_bound,
+            upper_bound
         }
     }
 }
@@ -375,14 +381,22 @@ impl<C, T> BoundedParameter<T> for BoundedParam<C, T> where C: Parameter<T>, T: 
         if (Bound::Unbounded::<T>, self.upper_bound).contains(&self.inner.shift_up()) {
             Ok(self.inner.shift_up())
         } else {
-            Err(())
+            if let Bound::Included(num) = self.upper_bound && self.inner.get() != num {
+                Ok(num)
+            } else {
+                Err(())
+            }
         }
     }
     fn shift_down(&self) -> Result<T, ()> {
         if (self.lower_bound, Bound::Unbounded::<T>).contains(&self.inner.shift_down()) {
             Ok(self.inner.shift_down())
         } else {
-            Err(())
+            if let Bound::Included(num) = self.lower_bound && self.inner.get() != num {
+                Ok(num)
+            } else {
+                Err(())
+            }
         }
     }
     fn set(&mut self, val: T) {
@@ -393,5 +407,11 @@ impl<C, T> BoundedParameter<T> for BoundedParam<C, T> where C: Parameter<T>, T: 
     }
     fn default(&self) -> T {
         self.inner.default()
+    }
+    fn lower_bound(&self) -> Bound<T> {
+        self.lower_bound
+    }
+    fn upper_bound(&self) -> Bound<T> {
+        self.upper_bound
     }
 }

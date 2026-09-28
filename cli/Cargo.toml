@@ -9,3 +9,4 @@ crossterm = "0.29"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 cpal = "0.18"
 num-traits = "0.2"
+phf = { version = "0.14", features = ["macros"] }
