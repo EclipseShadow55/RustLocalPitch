@@ -1,66 +1,45 @@
 mod parameters;
 
-use std::{
-    iter::{repeat_n, zip},
-    io,
-    sync::mpsc::{channel, Sender},
-    time::{Duration, Instant},
-    thread,
-    thread::{JoinHandle},
-    error,
-    ops::{Bound},
-    collections::HashMap,
-    fmt::Display
+use analysis::{
+    AudioMessage, OutputMessage,
+    detection::{ErrorTypes, FrameContext, peak_picking, sub_harmonic_summing, two_way_mismatch},
+    get_bins, start_process_thread,
+};
+use cpal::{
+    BufferSize, Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use phf::{Map as phfMap, phf_map};
+use ratatui::widgets::{BorderType, Wrap};
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout, Flex},
+    layout::{Alignment, Constraint, Flex, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Terminal,
 };
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device,
-    SampleFormat,
-    BufferSize,
-    Stream,
-    SupportedStreamConfig,
-    StreamConfig,
-};
-use ratatui::widgets::{BorderType, Wrap};
-use analysis::{
-    OutputMessage,
-    AudioMessage,
-    start_process_thread,
-    get_bins,
-    detection::{
-        ErrorTypes,
-        FrameContext,
-        sub_harmonic_summing,
-        peak_picking,
-        two_way_mismatch,
-    }
-};
-use phf::{
-    Map as phfMap,
-    phf_map
+use std::{
+    collections::HashMap,
+    error,
+    fmt::Display,
+    io,
+    iter::zip,
+    ops::Bound,
+    sync::mpsc::{Sender, channel},
+    thread,
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use parameters::{
+    BoolParam, BoundedParam, BoundedParameter, CyclicParam, ExponentialParam, LinearParam,
     Parameter,
-    BoundedParameter,
-    LinearParam,
-    ExponentialParam,
-    CyclicParam,
-    BoolParam,
-    BoundedParam,
 };
 
 /*
@@ -76,10 +55,13 @@ OR {Yellow} BELOW SUGGESTED RANGE   |
 (OR) {GREEN} WITHIN SUGGESTED RANGE |
 */
 
-
-static LETTERS: &[&str] = &["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-static LETTERS_DISP: &[&str] = &{[
-r"
+// TODO: fix Two-Way Mismatch
+static LETTERS: &[&str] = &[
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+static LETTERS_DISP: &[&str] = &{
+    [
+        r"
    ___________
   /           |
  /     _______|
@@ -92,7 +74,7 @@ r"
  \            |
   \___________|
 ",
-r"
+        r"
    ___________   __   __
   /           | |  | |  |
  /     _______|_|  |_|  |__
@@ -105,7 +87,7 @@ r"
  \            | |  | |  |
   \___________| |__| |__|
 ",
-r"
+        r"
  ___________
 |           \
 |     ___    \
@@ -118,7 +100,7 @@ r"
 |            /
 |___________/
 ",
-r"
+        r"
 
  ___________      __   __
 |           \    |  | |  |
@@ -132,7 +114,7 @@ r"
 |            /   |  | |  |
 |___________/    |__| |__|
 ",
-r"
+        r"
  _____________
 |             |
 |      _______|
@@ -145,7 +127,7 @@ r"
 |             |
 |_____________|
 ",
-r"
+        r"
  _____________
 |             |
 |      _______|
@@ -158,7 +140,7 @@ r"
 |     |
 |_____|
 ",
-r"
+        r"
  _____________   __   __
 |             | |  | |  |
 |      _______|_|  |_|  |__
@@ -171,7 +153,7 @@ r"
 |     |         |  | |  |
 |_____|         |__| |__|
 ",
-r"
+        r"
    ___________
   /           |
  /     _______|
@@ -184,7 +166,7 @@ r"
  \           /
   \_________/
 ",
-r"
+        r"
    ___________    __   __
   /           |  |  | |  |
  /     _______|__|  |_|  |__
@@ -197,7 +179,7 @@ r"
  \           /   |  | |  |
   \_________/    |__| |__|
 ",
-r"
+        r"
     _______
    /       \
   /   ___   \
@@ -210,7 +192,7 @@ r"
 |   |     |   |
 |___|     |___|
 ",
-r"
+        r"
     _______       __   __
    /       \     |  | |  |
   /   ___   \  __|  |_|  |__
@@ -223,7 +205,7 @@ r"
 |   |     |   |  |  | |  |
 |___|     |___|  |__| |__|
 ",
-r"
+        r"
  ___________
 |           \
 |    ____    \
@@ -235,11 +217,14 @@ r"
 |   |____/    |
 |            /
 |___________/
-"]};
+",
+    ]
+};
 
 static NUMBERS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
-static NUMBERS_DISP: &[&str] = &{[
-r"
+static NUMBERS_DISP: &[&str] = &{
+    [
+        r"
    _________
   /         \
  /    ___    \
@@ -252,7 +237,7 @@ r"
  \           /
   \_________/
 ",
-r"
+        r"
    ____
  /     |
 /__    |
@@ -265,7 +250,7 @@ r"
    |   |
    |___|
 ",
-r"
+        r"
  ________
 |        \
 |_____    \
@@ -278,7 +263,7 @@ r"
 |          |
 |__________|
 ",
-r"
+        r"
  _________
 |         \
 |______    \
@@ -291,7 +276,7 @@ r"
 |          /
 |_________/
 ",
-r"
+        r"
  ___   ___
 |   | |   |
 |   | |   |
@@ -304,7 +289,7 @@ r"
       |   |
       |___|
 ",
-r"
+        r"
  __________
 |          |
 |    ______|
@@ -317,7 +302,7 @@ r"
 |         /
 |________/
 ",
-r"
+        r"
      _____
     /    /
    /    /
@@ -330,7 +315,7 @@ r"
  \             /
   \___________/
 ",
-r"
+        r"
  ______________
 |              |
 |_________     |
@@ -343,7 +328,7 @@ r"
    /    /
   /____/
 ",
-r"
+        r"
    ________
   /        \
  /    __    \
@@ -356,7 +341,7 @@ r"
  \          /
   \________/
 ",
-r"
+        r"
    ________
   /        \
  /    __    \
@@ -368,9 +353,12 @@ r"
      /   /
     /   /
    /___/
-"]};
+",
+    ]
+};
 
-static NO_NOTE_DISP: &str = {r"
+static NO_NOTE_DISP: &str = {
+    r"
  ____     ____   _________   ____     ____ _____________
 |    \   |    | /         \ |    \   |    |             |
 |     \  |    |/    ___    \|     \  |    |      _______|
@@ -382,9 +370,11 @@ static NO_NOTE_DISP: &str = {r"
 |    | \      |    \___/    |    | \      |     |_______
 |    |  \     |\           /|    |  \     |             |
 |____|   \____| \_________/ |____|   \____|_____________|
-"};
+"
+};
 
-static ERROR_DISP: &str = {r"
+static ERROR_DISP: &str = {
+    r"
  _____________ ___________   ___________     _________   ___________
 |             |           \ |           \   /         \ |           \
 |      _______|    ____    \|    ____    \ /    ___    \|    ____    \
@@ -396,69 +386,66 @@ static ERROR_DISP: &str = {r"
 |     |_______|   |    \   \|   |    \   \|    \___/    |   |    \   \
 |             |   |     |   |   |     |   |\           /|   |     |   |
 |_____________|___|     |___|___|     |___| \_________/ |___|     |___|
-"};
+"
+};
 
-static FREQUENCIES: &[f32] = &{[
-    16.35160,
-    17.32391,
-    18.35405,
-    19.44544,
-    20.60172,
-    21.82676,
-    23.12465,
-    24.49971,
-    25.95654,
-    27.50000,
-    29.13524,
-    30.86771,
-]};
+static FREQUENCIES: &[f32] = &{
+    [
+        16.35160, 17.32391, 18.35405, 19.44544, 20.60172, 21.82676, 23.12465, 24.49971, 25.95654,
+        27.50000, 29.13524, 30.86771,
+    ]
+};
 
-static DETECT_METHODS: &[&str] = &{[
-    "Sub-Harmonic Summing (Default)",
-    "Peak Picking",
-    "Two-Way Mismatch",
-]};
+static DETECT_METHODS: &[&str] = &{
+    [
+        "Sub-Harmonic Summing (Default)",
+        "Peak Picking",
+        "Two-Way Mismatch",
+    ]
+};
 /*
     "Spectral Autocorrelation",
     "Comb Distance",
     "Template Matching",
 */
 
-static LSB_UI: &[&str] = &{[
-    "min_freq",
-    "max_freq",
-    "vol_filter",
-    "detect_mode",
-    "vol_steepness",
-]};
-static PITCH_DISPLAY_UI: &[&str] = &{[
-    "pitch",
-]};
-static VOL_DISPLAY_UI: &[&str] = &{[
-    "vol"
-]};
-static RSB_SHS_UI: &[&str] = &{[
-    "num_harmonics",
-    "harmonic_decay",
-    "comp_turn_point",
-    "favor_low",
-    "peak_threshold",
-]};
-static RSB_TWM_UI: &[&str] = &{[
-    "predicted_harms",
-    "measured_peaks",
-    "freq_penalty",
-    "amp_weight",
-    "freq_weight",
-    "error_ratio",
-]};
+static LSB_UI: &[&str] = &{
+    [
+        "min_freq",
+        "max_freq",
+        "vol_filter",
+        "vol_steepness",
+        "detect_mode",
+    ]
+};
+static PITCH_DISPLAY_UI: &[&str] = &{ ["pitch"] };
+static VOL_DISPLAY_UI: &[&str] = &{ ["vol"] };
+static RSB_SHS_UI: &[&str] = &{
+    [
+        "num_harmonics",
+        "harmonic_decay",
+        "comp_turn_point",
+        "favor_low",
+        "peak_threshold",
+    ]
+};
+static RSB_TWM_UI: &[&str] = &{
+    [
+        "predicted_harms",
+        "measured_peaks",
+        "freq_penalty",
+        "amp_weight",
+        "freq_weight",
+        "error_ratio",
+    ]
+};
 
 static UI_ID_TO_NAMES: phfMap<&'static str, &'static str> = phf_map! {
     "min_freq" => "Minimum Frequency",
     "max_freq" => "Maximum Frequency",
     "vol_filter" => "Volume Filter",
-    "detect_mode" => "Detection Mode",
     "vol_steepness" => "Volume Steepness",
+    "detect_mode" => "Detection Mode",
     "pitch" => "Pitch Display",
     "vol" => "Volume Display", // shortened to "Volume" in widget
     "num_harmonics" => "Number of Harmonics",
@@ -474,38 +461,42 @@ static UI_ID_TO_NAMES: phfMap<&'static str, &'static str> = phf_map! {
     "error_ratio" => "Error Ratio",
 };
 
-static UI_IDS_W_SUGGESTED: &[&str] = &{[
-    LSB_UI[2],
-    LSB_UI[4],
-    RSB_SHS_UI[0],
-    RSB_SHS_UI[1],
-    RSB_SHS_UI[2],
-    RSB_SHS_UI[3],
-    RSB_SHS_UI[4],
-    RSB_TWM_UI[0],
-    RSB_TWM_UI[1],
-    RSB_TWM_UI[2],
-    RSB_TWM_UI[3],
-    RSB_TWM_UI[4],
-    RSB_TWM_UI[5],
-]};
+static UI_IDS_W_SUGGESTED: &[&str] = &{
+    [
+        LSB_UI[2],
+        LSB_UI[3],
+        RSB_SHS_UI[0],
+        RSB_SHS_UI[1],
+        RSB_SHS_UI[2],
+        RSB_SHS_UI[3],
+        RSB_SHS_UI[4],
+        RSB_TWM_UI[0],
+        RSB_TWM_UI[1],
+        RSB_TWM_UI[2],
+        RSB_TWM_UI[3],
+        RSB_TWM_UI[4],
+        RSB_TWM_UI[5],
+    ]
+};
 
-static UI_IDS_W_DIRECTION: &[&str] = &{[
-    LSB_UI[0],
-    LSB_UI[1],
-    LSB_UI[2],
-    LSB_UI[4],
-    RSB_SHS_UI[0],
-    RSB_SHS_UI[1],
-    RSB_SHS_UI[2],
-    RSB_SHS_UI[4],
-    RSB_TWM_UI[0],
-    RSB_TWM_UI[1],
-    RSB_TWM_UI[2],
-    RSB_TWM_UI[3],
-    RSB_TWM_UI[4],
-    RSB_TWM_UI[5],
-]};
+static UI_IDS_W_DIRECTION: &[&str] = &{
+    [
+        LSB_UI[0],
+        LSB_UI[1],
+        LSB_UI[2],
+        LSB_UI[3],
+        RSB_SHS_UI[0],
+        RSB_SHS_UI[1],
+        RSB_SHS_UI[2],
+        RSB_SHS_UI[4],
+        RSB_TWM_UI[0],
+        RSB_TWM_UI[1],
+        RSB_TWM_UI[2],
+        RSB_TWM_UI[3],
+        RSB_TWM_UI[4],
+        RSB_TWM_UI[5],
+    ]
+};
 
 static COLOR_BASES: phfMap<&'static str, (u8, u8, u8)> = phf_map! {
     "blue" => (57, 147, 212),
@@ -516,7 +507,6 @@ static COLOR_BASES: phfMap<&'static str, (u8, u8, u8)> = phf_map! {
     "yellow" => (231, 166, 54),
     "grey" => (143, 143, 143),
 };
-
 
 fn main() -> Result<(), Box<dyn error::Error>> {
     let mut colors: HashMap<&str, Color> = HashMap::new();
@@ -533,74 +523,68 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-
     let min_pos_freq: f32 = FREQUENCIES[0];
     let max_pos_freq: f32 = FREQUENCIES[11] * 2.0f32.powf(9.0);
 
     // Frequency Parameters
-    let mut min_freq = {
-        ExponentialParam::new(
-            FREQUENCIES[0] * 2.0f32.powf(2.0),
-            2.0f32.powf(1.0 / 12.0)
-        )
-    };
-    let mut max_freq = {
-        ExponentialParam::new(
-            FREQUENCIES[11] * 2.0f32.powf(6.0),
-            2.0f32.powf(1.0 / 12.0)
-        )
-    };
+    let mut min_freq =
+        { ExponentialParam::new(FREQUENCIES[0] * 2.0f32.powf(2.0), 2.0f32.powf(1.0 / 12.0)) };
+    let mut max_freq =
+        { ExponentialParam::new(FREQUENCIES[11] * 2.0f32.powf(6.0), 2.0f32.powf(1.0 / 12.0)) };
 
     let mut min_freq_bound: f32 = min_freq.shift_up();
     let mut max_freq_bound: f32 = max_freq.shift_down();
     let mut bins = get_bins(min_freq.get(), max_freq.get(), 12);
 
-    let (_device, audio_stream, out_post, handle) = setup_audio_callback(min_freq.get(), max_freq.get(), 12, in_post, BufferSize::Fixed(512))?;
+    let (_device, audio_stream, out_post, handle) = setup_audio_callback(
+        min_freq.get(),
+        max_freq.get(),
+        12,
+        in_post,
+        BufferSize::Fixed(512),
+    )?;
 
     // Volume Parameters
-    let mut vol_filter = { // 0.003 - 0.010
+    let mut vol_filter = {
+        // 0.003 - 0.010
         BoundedParam::new(
-            LinearParam::new(
-                0.005f32,
-                0.001),
+            LinearParam::new(0.005f32, 0.001),
             Bound::Included(0.0),
-            Bound::Included(1000.0)
+            Bound::Included(1.0),
         )
     };
-    let mut vol_steepness = { // 2 - 4
+    let mut vol_steepness = {
+        // 2 - 4
         BoundedParam::new(
-            LinearParam::new(
-                2,
-                1),
-            Bound::Included(2),
+            LinearParam::new(2, 1),
+            Bound::Included(1),
             Bound::Included(40),
         )
     };
 
     // Detection Parameters
     let mut detect_mode = {
-        CyclicParam::new(
-            0,
-            1,
-            DETECT_METHODS.len(),
-            0
-        ).map_err(|_| "invalid bounds for detect mode")?
+        CyclicParam::new(0, 1, DETECT_METHODS.len(), 0)
+            .map_err(|_| "invalid bounds for detect mode")?
     };
-    let mut shs_num_harmonics = { // 3 - 8
+    let mut shs_num_harmonics = {
+        // 3 - 8
         BoundedParam::new(
             LinearParam::new(4u8, 1),
             Bound::Included(1),
-            Bound::Included(20)
+            Bound::Included(20),
         )
     };
-    let mut shs_harmonic_decay = { // 0.7 - 0.9
+    let mut shs_harmonic_decay = {
+        // 0.7 - 0.9
         BoundedParam::new(
             LinearParam::new(0.85f32, 0.05),
             Bound::Included(0.0),
-            Bound::Included(1.0)
+            Bound::Included(1.0),
         )
     };
-    let mut shs_comp_turn_point = { // 10 - 1000
+    let mut shs_comp_turn_point = {
+        // 10 - 1000
         BoundedParam::new(
             ExponentialParam::new(100.0f32, 10.0f32.powf(1.0f32 / 3.0)),
             Bound::Included(1.0),
@@ -608,54 +592,61 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         )
     };
     let mut shs_favor_low = BoolParam::new(true); // true
-    let mut shs_peak_threshold = { // 0.8 - 0.95
+    let mut shs_peak_threshold = {
+        // 0.8 - 0.95
         BoundedParam::new(
             LinearParam::new(0.9f32, 0.02),
             Bound::Included(0.0),
-            Bound::Included(1.0)
+            Bound::Included(1.0),
         )
     };
 
-    let mut twm_predicted_harms = { // 8 - 15; changes max detected frequency
+    let mut twm_predicted_harms = {
+        // 8 - 15; changes max detected frequency
         BoundedParam::new(
             LinearParam::new(10usize, 1),
             Bound::Included(3),
             Bound::Included(20),
         )
     };
-    let mut twm_measured_peaks = { // 8 - 15
+    let mut twm_measured_peaks = {
+        // 8 - 15
         BoundedParam::new(
             LinearParam::new(10usize, 1),
             Bound::Included(2),
             Bound::Included(20),
         )
     };
-    let mut twm_freq_penalty = { // 0.25 - 0.75
+    let mut twm_freq_penalty = {
+        // 0.25 - 0.75
         BoundedParam::new(
             LinearParam::new(0.5f32, 0.05),
             Bound::Included(0.0),
             Bound::Included(2.0),
         )
     };
-    let mut twm_amp_weight = { // 0.05 - 0.20
+    let mut twm_amp_weight = {
+        // 0.05 - 0.20
         BoundedParam::new(
             ExponentialParam::new(0.1f32, 2.0),
             Bound::Included(0.0625),
             Bound::Included(20.0),
         )
     };
-    let mut twm_freq_weight = { // 0.2 - 0.8
+    let mut twm_freq_weight = {
+        // 0.2 - 0.8
         BoundedParam::new(
             ExponentialParam::new(0.4f32, 2.0),
             Bound::Included(0.0625),
             Bound::Included(20.0),
         )
     };
-    let mut twm_error_ratio = { // 0.2 - 0.6
+    let mut twm_error_ratio = {
+        // 0.2 - 0.6
         BoundedParam::new(
             LinearParam::new(0.5f32, 0.05),
             Bound::Included(0.0),
-            Bound::Included(1.0)
+            Bound::Included(1.0),
         )
     };
 
@@ -676,8 +667,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         while let Ok(msg) = in_mail.try_recv() {
             match msg {
                 OutputMessage::NewFreqFrame(frame_data) => {
-                    last_vol = *frame_data.iter()
-                        .max_by(|a, b| a.total_cmp(b)).unwrap();
+                    last_vol = *frame_data.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
 
                     let mut max_ind: Result<usize, usize> = Err(0);
 
@@ -688,12 +678,14 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                             bins_per_octave: 12,
                         };
                         if detect_mode == 0 {
-                            match sub_harmonic_summing(frame_context,
-                                                       shs_num_harmonics.get(),
-                                                       shs_harmonic_decay.get(),
-                                                       shs_comp_turn_point.get(),
-                                                       shs_favor_low.get(),
-                                                       shs_peak_threshold.get()) {
+                            match sub_harmonic_summing(
+                                frame_context,
+                                shs_num_harmonics.get(),
+                                shs_harmonic_decay.get(),
+                                shs_comp_turn_point.get(),
+                                shs_favor_low.get(),
+                                shs_peak_threshold.get(),
+                            ) {
                                 Ok(max_index) => max_ind = Ok(max_index),
                                 Err(ErrorTypes::BreakError(desc)) => Err(desc)?,
                                 Err(ErrorTypes::StandardError) => max_ind = Err(0),
@@ -705,13 +697,15 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                                 Err(ErrorTypes::StandardError) => max_ind = Err(0),
                             }
                         } else if detect_mode == 2 {
-                            match two_way_mismatch(frame_context,
-                                                   twm_predicted_harms.get(),
-                                                   twm_measured_peaks.get(),
-                                                   twm_freq_penalty.get(),
-                                                   twm_amp_weight.get(),
-                                                   twm_freq_weight.get(),
-                                                   twm_error_ratio.get()) {
+                            match two_way_mismatch(
+                                frame_context,
+                                twm_predicted_harms.get(),
+                                twm_measured_peaks.get(),
+                                twm_freq_penalty.get(),
+                                twm_amp_weight.get(),
+                                twm_freq_weight.get(),
+                                twm_error_ratio.get(),
+                            ) {
                                 Ok(max_index) => max_ind = Ok(max_index),
                                 Err(ErrorTypes::BreakError(desc)) => Err(desc)?,
                                 Err(ErrorTypes::StandardError) => max_ind = Err(0),
@@ -719,20 +713,17 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         }
 
                         match max_ind {
-                            Ok(max_index) => {
-                                match freq_to_inds(bins[max_index]) {
-                                    Ok((let_ind, oct_ind)) => {
-                                        current_note = horizontal_concat(&normalize_disp_str(LETTERS_DISP[let_ind]), &normalize_disp_str(NUMBERS_DISP[oct_ind]));
-                                    },
-                                    Err((_, desc)) => Err(desc)?
+                            Ok(max_index) => match freq_to_inds(bins[max_index]) {
+                                Ok((let_ind, oct_ind)) => {
+                                    current_note = horizontal_concat(
+                                        &normalize_disp_str(LETTERS_DISP[let_ind]),
+                                        &normalize_disp_str(NUMBERS_DISP[oct_ind]),
+                                    );
                                 }
+                                Err((_, desc)) => Err(desc)?,
                             },
-                            Err(0) => {
-                                current_note = normalize_disp_str(NO_NOTE_DISP)
-                            },
-                            Err(_) => {
-                                current_note = normalize_disp_str(ERROR_DISP)
-                            },
+                            Err(0) => current_note = normalize_disp_str(NO_NOTE_DISP),
+                            Err(_) => current_note = normalize_disp_str(ERROR_DISP),
                         };
                         last_note = Instant::now();
                     }
@@ -753,7 +744,6 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                     min_freq_bound = min_freq.shift_up();
                     max_freq_bound = max_freq.shift_down();
                     bins = get_bins(min_freq.get(), max_freq.get(), 12);
-
                 }
                 _ => {}
             }
@@ -863,8 +853,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                                 .fg(get_border_fg(selected, LSB_UI[2], &colors))
                                 .bg(get_border_bg(selected, LSB_UI[2], &colors))))
                 };
-                let lsb_detect_mode_widget = {
-                    Paragraph::new(format!("{} - {}", detect_mode.get(), DETECT_METHODS[detect_mode.get()]))
+                let lsb_vol_steepness_widget = {
+                    Paragraph::new(format!("{}", vol_steepness.get()))
                         .style(Style::default()
                             .fg(get_text_fg(selected, LSB_UI[3], &colors))
                             .bg(get_text_bg(selected, LSB_UI[3], &colors))
@@ -878,8 +868,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                                 .fg(get_border_fg(selected, LSB_UI[3], &colors))
                                 .bg(get_border_bg(selected, LSB_UI[3], &colors))))
                 };
-                let lsb_vol_steepness_widget = {
-                    Paragraph::new(format!("{}", vol_steepness.get()))
+                let lsb_detect_mode_widget = {
+                    Paragraph::new(format!("{} - {}", detect_mode.get(), DETECT_METHODS[detect_mode.get()]))
                         .style(Style::default()
                             .fg(get_text_fg(selected, LSB_UI[4], &colors))
                             .bg(get_text_bg(selected, LSB_UI[4], &colors))
@@ -894,7 +884,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                                 .bg(get_border_bg(selected, LSB_UI[4], &colors))))
                 };
 
-                let [lsb_min_freq_area, _lsb_spacer1, lsb_max_freq_area, _lsb_spacer2, lsb_str_filer_area, _lsb_spacer3, lsb_detect_mode_area, _lsb_spacer4, lsb_vol_steepness_area] = {
+                let [lsb_min_freq_area, _lsb_spacer1, lsb_max_freq_area, _lsb_spacer2, lsb_str_filer_area, _lsb_spacer3, lsb_vol_steepness_area, _lsb_spacer4, lsb_detect_mode_area] = {
                     Layout::vertical([
                         Constraint::Length((lsb_min_freq_widget.line_count(left_sidebar_width - 2) + 2) as u16),
                         Constraint::Length(1),
@@ -902,9 +892,9 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         Constraint::Length(1),
                         Constraint::Length((lsb_vol_filter_widget.line_count(left_sidebar_width - 2) + 2) as u16),
                         Constraint::Length(1),
-                        Constraint::Length((lsb_detect_mode_widget.line_count(left_sidebar_width - 2) + 2) as u16),
-                        Constraint::Length(1),
                         Constraint::Length((lsb_vol_steepness_widget.line_count(left_sidebar_width - 2) + 2) as u16),
+                        Constraint::Length(1),
+                        Constraint::Length((lsb_detect_mode_widget.line_count(left_sidebar_width - 2) + 2) as u16),
                     ]).flex(Flex::Start)
                         .areas(left_sidebar_area)
                 };
@@ -936,7 +926,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                             .bg(get_border_bg(selected, LSB_UI[2], &colors)))
                         .title(format!(" {} ", UI_ID_TO_NAMES[LSB_UI[2]]))
                 };
-                let lsb_detect_mode_border_block = {
+                let lsb_vol_steepness_border_block = {
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Thick)
@@ -945,7 +935,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                             .bg(get_border_bg(selected, LSB_UI[3], &colors)))
                         .title(format!(" {} ", UI_ID_TO_NAMES[LSB_UI[3]]))
                 };
-                let lsb_vol_steepness_border_block = {
+                let lsb_detect_mode_border_block = {
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Thick)
@@ -958,20 +948,20 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 let lsb_min_freq_content_area = lsb_min_freq_border_block.inner(lsb_min_freq_area);
                 let lsb_max_freq_content_area = lsb_max_freq_border_block.inner(lsb_max_freq_area);
                 let lsb_vol_filter_content_area = lsb_vol_filter_border_block.inner(lsb_str_filer_area);
-                let lsb_detect_mode_content_area = lsb_detect_mode_border_block.inner(lsb_detect_mode_area);
                 let lsb_vol_steepness_content_area = lsb_vol_steepness_border_block.inner(lsb_vol_steepness_area);
+                let lsb_detect_mode_content_area = lsb_detect_mode_border_block.inner(lsb_detect_mode_area);
 
                 frame.render_widget(lsb_min_freq_border_block, lsb_min_freq_area);
                 frame.render_widget(lsb_max_freq_border_block, lsb_max_freq_area);
                 frame.render_widget(lsb_vol_filter_border_block, lsb_str_filer_area);
-                frame.render_widget(lsb_detect_mode_border_block, lsb_detect_mode_area);
                 frame.render_widget(lsb_vol_steepness_border_block, lsb_vol_steepness_area);
+                frame.render_widget(lsb_detect_mode_border_block, lsb_detect_mode_area);
 
                 frame.render_widget(lsb_min_freq_widget, lsb_min_freq_content_area);
                 frame.render_widget(lsb_max_freq_widget, lsb_max_freq_content_area);
                 frame.render_widget(lsb_vol_filter_widget, lsb_vol_filter_content_area);
-                frame.render_widget(lsb_detect_mode_widget, lsb_detect_mode_content_area);
                 frame.render_widget(lsb_vol_steepness_widget, lsb_vol_steepness_content_area);
+                frame.render_widget(lsb_detect_mode_widget, lsb_detect_mode_content_area);
             }
 
             // Render Pitch Display
@@ -1422,7 +1412,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             }
 
             // Render Tooltips
-            {
+            if selected != "None" {
                 let [tooltips_area] = {
                     Layout::horizontal([
                         Constraint::Length(tooltips_width),
@@ -1438,6 +1428,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                             .fg(colors["blue"])
                             .bg(colors["green"]))
                         .title(" Tooltips ")
+                        .style(Style::default()
+                            .fg(colors["blue"]))
                 };
                 let tooltips_block2 = {
                     Block::default()
@@ -1448,463 +1440,633 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                             .bg(colors["green"]))
                 };
 
-                if selected != "None" {
-                    let tooltips_block2_area = tooltips_block1.inner(tooltips_area);
-                    let tooltips_content_area = tooltips_block2.inner(tooltips_block2_area);
+                let tooltips_block2_area = tooltips_block1.inner(tooltips_area);
+                let tooltips_content_area = tooltips_block2.inner(tooltips_block2_area);
 
-                    let mut tooltips_info_lines: Vec<Line> = Vec::new();
+                // Tooltips Info
+                let mut tooltips_info_lines: Vec<Line> = Vec::new();
+                tooltips_info_lines.push({
+                    Line::from(Span::styled(UI_ID_TO_NAMES[selected],
+                                            Style::default()
+                                                .add_modifier(Modifier::UNDERLINED)))
+                }); // Name
+                if selected == PITCH_DISPLAY_UI[0] || selected == VOL_DISPLAY_UI[0] {
                     tooltips_info_lines.push({
-                        Line::from(Span::styled(UI_ID_TO_NAMES[selected],
+                        Line::from(Span::styled("Not Modifiable",
                                                 Style::default()
-                                                    .fg(colors["blue"])
-                                                    .add_modifier(Modifier::UNDERLINED)))
-                    }); // Name
-                    if selected == PITCH_DISPLAY_UI[0] || selected == VOL_DISPLAY_UI[0] {
-                        tooltips_info_lines.push({
-                            Line::from(Span::styled("Not Modifiable",
-                                                    Style::default()
-                                                        .fg(colors["grey"])))
-                        }); // No Modification
-                    } else {
-                        tooltips_info_lines.push({
-                            Line::from(Span::styled("Arrow Up / Down OR Scroll Wheel",
-                                                    Style::default().fg(colors["blue"])))
-                        }); // Modification Keys
-                        tooltips_info_lines.push({
-                            Line::from(Span::styled({
-                                                        if selected == LSB_UI[0] {
-                                                            format!("Range: [{min_pos_freq}, {max_freq_bound}]")
-                                                        } else if selected == LSB_UI[1] {
-                                                            format!("Range: [{min_freq_bound}, {max_pos_freq}]")
-                                                        } else if selected == LSB_UI[2] {
-                                                            format!("Range: {}", get_bounds_repr(vol_filter.lower_bound(), vol_filter.upper_bound()))
+                                                    .fg(colors["grey"])))
+                    }); // No Modification
+                } else {
+                    tooltips_info_lines.push({
+                        Line::from("Arrow Up / Down OR Scroll Wheel")
+                    }); // Modification Keys
+                    tooltips_info_lines.push({
+                        Line::from({
+                                                    if selected == LSB_UI[0] {
+                                                        format!("Range: [{min_pos_freq}, {max_freq_bound}]")
+                                                    } else if selected == LSB_UI[1] {
+                                                        format!("Range: [{min_freq_bound}, {max_pos_freq}]")
+                                                    } else if selected == LSB_UI[2] {
+                                                        format!("Range: {}", get_bounds_repr(vol_filter.lower_bound(), vol_filter.upper_bound()))
+                                                    } else if selected == LSB_UI[3] {
+                                                        format!("Range: {}", get_bounds_repr(vol_steepness.lower_bound(), vol_steepness.upper_bound()))
+                                                    } else if selected == LSB_UI[4] {
+                                                        format!("Range: [0, {}]", DETECT_METHODS.len())
+                                                    } else if selected == RSB_SHS_UI[0] {
+                                                        format!("Range: {}", get_bounds_repr(shs_num_harmonics.lower_bound(), shs_num_harmonics.upper_bound()))
+                                                    } else if selected == RSB_SHS_UI[1] {
+                                                        format!("Range: {}", get_bounds_repr(shs_harmonic_decay.lower_bound(), shs_harmonic_decay.upper_bound()))
+                                                    } else if selected == RSB_SHS_UI[2] {
+                                                        format!("Range: {}", get_bounds_repr(shs_comp_turn_point.lower_bound(), shs_comp_turn_point.upper_bound()))
+                                                    } else if selected == RSB_SHS_UI[3] {
+                                                        String::from("Range: Yes / No")
+                                                    } else if selected == RSB_SHS_UI[4] {
+                                                        format!("Range: {}", get_bounds_repr(shs_peak_threshold.lower_bound(), shs_peak_threshold.upper_bound()))
+                                                    } else if selected == RSB_TWM_UI[0] {
+                                                        format!("Range: {}", get_bounds_repr(twm_predicted_harms.lower_bound(), twm_predicted_harms.upper_bound()))
+                                                    } else if selected == RSB_TWM_UI[1] {
+                                                        format!("Range: {}", get_bounds_repr(twm_measured_peaks.lower_bound(), twm_measured_peaks.upper_bound()))
+                                                    } else if selected == RSB_TWM_UI[2] {
+                                                        format!("Range: {}", get_bounds_repr(twm_freq_penalty.lower_bound(), twm_freq_penalty.upper_bound()))
+                                                    } else if selected == RSB_TWM_UI[3] {
+                                                        format!("Range: {}", get_bounds_repr(twm_amp_weight.lower_bound(), twm_amp_weight.upper_bound()))
+                                                    } else if selected == RSB_TWM_UI[4] {
+                                                        format!("Range: {}", get_bounds_repr(twm_freq_weight.lower_bound(), twm_freq_weight.upper_bound()))
+                                                    } else if selected == RSB_TWM_UI[5] {
+                                                        format!("Range: {}", get_bounds_repr(twm_error_ratio.lower_bound(), twm_error_ratio.upper_bound()))
+                                                    } else {
+                                                        String::from("")
+                                                    }
+                                                })
+                    }); // Range
+                    if UI_IDS_W_SUGGESTED.contains(&selected) {
+                        tooltips_info_lines.push(
+                            Line::from({
+                                                        if selected == LSB_UI[2] {
+                                                            "Suggested: [0.003, 0.03]"
                                                         } else if selected == LSB_UI[3] {
-                                                            format!("Range: [0, {}]", DETECT_METHODS.len())
-                                                        } else if selected == LSB_UI[4] {
-                                                            format!("Range: {}", get_bounds_repr(vol_steepness.lower_bound(), vol_steepness.upper_bound()))
+                                                            "Suggested: [2, 4]"
                                                         } else if selected == RSB_SHS_UI[0] {
-                                                            format!("Range: {}", get_bounds_repr(shs_num_harmonics.lower_bound(), shs_num_harmonics.upper_bound()))
+                                                            "Suggested: [3, 8]"
                                                         } else if selected == RSB_SHS_UI[1] {
-                                                            format!("Range: {}", get_bounds_repr(shs_harmonic_decay.lower_bound(), shs_harmonic_decay.upper_bound()))
+                                                            "Suggested: [0.7, 0.9]"
                                                         } else if selected == RSB_SHS_UI[2] {
-                                                            format!("Range: {}", get_bounds_repr(shs_comp_turn_point.lower_bound(), shs_comp_turn_point.upper_bound()))
+                                                            "Suggested: [10.0, 1000.0]"
                                                         } else if selected == RSB_SHS_UI[3] {
-                                                            String::from("Range: Yes / No")
+                                                            "Suggested: Yes"
                                                         } else if selected == RSB_SHS_UI[4] {
-                                                            format!("Range: {}", get_bounds_repr(shs_peak_threshold.lower_bound(), shs_peak_threshold.upper_bound()))
-                                                        } else if selected == RSB_TWM_UI[0] {
-                                                            format!("Range: {}", get_bounds_repr(twm_predicted_harms.lower_bound(), twm_predicted_harms.upper_bound()))
-                                                        } else if selected == RSB_TWM_UI[1] {
-                                                            format!("Range: {}", get_bounds_repr(twm_measured_peaks.lower_bound(), twm_measured_peaks.upper_bound()))
+                                                            "Suggested: [0.8, 0.95]"
+                                                        } else if selected == RSB_TWM_UI[0] || selected == RSB_TWM_UI[1] {
+                                                            "Suggested: [8, 15]"
                                                         } else if selected == RSB_TWM_UI[2] {
-                                                            format!("Range: {}", get_bounds_repr(twm_freq_penalty.lower_bound(), twm_freq_penalty.upper_bound()))
+                                                            "Suggested: [0.25, 0.75]"
                                                         } else if selected == RSB_TWM_UI[3] {
-                                                            format!("Range: {}", get_bounds_repr(twm_amp_weight.lower_bound(), twm_amp_weight.upper_bound()))
+                                                            "Suggested: [0.05, 0.2]"
                                                         } else if selected == RSB_TWM_UI[4] {
-                                                            format!("Range: {}", get_bounds_repr(twm_freq_weight.lower_bound(), twm_freq_weight.upper_bound()))
+                                                            "Suggested: [0.2, 0.8]"
                                                         } else if selected == RSB_TWM_UI[5] {
-                                                            format!("Range: {}", get_bounds_repr(twm_error_ratio.lower_bound(), twm_error_ratio.upper_bound()))
+                                                            "Suggested: [0.2, 0.6]"
                                                         } else {
-                                                            String::from("")
+                                                            ""
                                                         }
-                                                    },
-                                                    Style::default().fg(colors["blue"])))
-                        }); // Range
-                        if UI_IDS_W_SUGGESTED.contains(&selected) {
-                            tooltips_info_lines.push(
-                                Line::from(Span::styled({
-                                                            if selected == LSB_UI[2] {
-                                                                "Suggested: [0.003, 0.03]"
-                                                            } else if selected == LSB_UI[4] {
-                                                                "Suggested: [2, 4]"
-                                                            } else if selected == RSB_SHS_UI[0] {
-                                                                "Suggested: [3, 8]"
-                                                            } else if selected == RSB_SHS_UI[1] {
-                                                                "Suggested: [0.7, 0.9]"
-                                                            } else if selected == RSB_SHS_UI[2] {
-                                                                "Suggested: [10.0, 1000.0]"
-                                                            } else if selected == RSB_SHS_UI[3] {
-                                                                "Suggested: Yes"
-                                                            } else if selected == RSB_SHS_UI[4] {
-                                                                "Suggested: [0.8, 0.95]"
-                                                            } else if selected == RSB_TWM_UI[0] || selected == RSB_TWM_UI[1] {
-                                                                "Suggested: [8, 15]"
-                                                            } else if selected == RSB_TWM_UI[2] {
-                                                                "Suggested: [0.25, 0.75]"
-                                                            } else if selected == RSB_TWM_UI[3] {
-                                                                "Suggested: [0.05, 0.2]"
-                                                            } else if selected == RSB_TWM_UI[4] {
-                                                                "Suggested: [0.2, 0.8]"
-                                                            } else if selected == RSB_TWM_UI[5] {
-                                                                "Suggested: [0.2, 0.6]"
-                                                            } else {
-                                                                ""
-                                                            }
-                                                        },
-                                                        Style::default().fg(colors["blue"])))
-                            );
+                                                    })
+                        );
+                        tooltips_info_lines.push(Line::from(""));
+                        let mut within = 0;
+                        if UI_IDS_W_DIRECTION.contains(&selected) {
+                            tooltips_info_lines.push(Line::from(Span::styled({
+                                                                                if selected == LSB_UI[2] {
+                                                                                    if vol_filter < 0.003 {
+                                                                                        if vol_filter.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if vol_filter > 0.03 {
+                                                                                        if vol_filter.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == LSB_UI[3] {
+                                                                                    if vol_steepness < 2 {
+                                                                                        if vol_steepness.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if vol_steepness > 4 {
+                                                                                        if vol_steepness.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_SHS_UI[0] {
+                                                                                    if shs_num_harmonics < 3 {
+                                                                                        if shs_num_harmonics.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if shs_num_harmonics > 8 {
+                                                                                        if shs_num_harmonics.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_SHS_UI[1] {
+                                                                                    if shs_harmonic_decay < 0.7 {
+                                                                                        if shs_harmonic_decay.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if shs_harmonic_decay > 0.9 {
+                                                                                        if shs_harmonic_decay.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_SHS_UI[2] {
+                                                                                    if shs_comp_turn_point < 10.0 {
+                                                                                        if shs_comp_turn_point.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if shs_comp_turn_point > 1000.0 {
+                                                                                        if shs_comp_turn_point.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_SHS_UI[4] {
+                                                                                    if shs_peak_threshold < 0.8 {
+                                                                                        if shs_peak_threshold.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if shs_peak_threshold > 0.95 {
+                                                                                        if shs_peak_threshold.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_TWM_UI[0] {
+                                                                                    if twm_predicted_harms < 8 {
+                                                                                        if twm_predicted_harms.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if twm_predicted_harms > 15 {
+                                                                                        if twm_predicted_harms.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_TWM_UI[1] {
+                                                                                    if twm_measured_peaks < 8 {
+                                                                                        if twm_measured_peaks.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if twm_measured_peaks > 15 {
+                                                                                        if twm_measured_peaks.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_TWM_UI[2] {
+                                                                                    if twm_freq_penalty < 0.25 {
+                                                                                        if twm_freq_penalty.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if twm_freq_penalty > 0.75 {
+                                                                                        if twm_freq_penalty.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_TWM_UI[3] {
+                                                                                    if twm_amp_weight < 0.05 {
+                                                                                        if twm_amp_weight.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if twm_amp_weight > 0.2 {
+                                                                                        if twm_amp_weight.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_TWM_UI[4] {
+                                                                                    if twm_freq_weight < 0.2 {
+                                                                                        if twm_freq_weight.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if twm_freq_weight > 0.8 {
+                                                                                        if twm_freq_weight.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else if selected == RSB_TWM_UI[5] {
+                                                                                    if twm_error_ratio < 0.2 {
+                                                                                        if twm_error_ratio.shift_down().is_ok() {
+                                                                                            within = 1;
+                                                                                            "BELOW SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MINIMUM"
+                                                                                        }
+                                                                                    } else if twm_error_ratio > 0.6 {
+                                                                                        if twm_error_ratio.shift_up().is_ok() {
+                                                                                            within = 1;
+                                                                                            "ABOVE SUGGESTED RANGE"
+                                                                                        } else {
+                                                                                            within = 2;
+                                                                                            "AT MAXIMUM"
+                                                                                        }
+                                                                                    } else {
+                                                                                        "WITHIN SUGGESTED RANGE"
+                                                                                    }
+                                                                                } else {
+                                                                                    ""
+                                                                                }
+                                                                            },
+                                                                             Style::default()
+                                                                                .fg(if within == 0 {
+                                                                                    colors["lightgreen"]
+                                                                                } else if within == 1 {
+                                                                                    colors["yellow"]
+                                                                                } else {
+                                                                                    colors["red"]
+                                                                                }))))
+                        } else {
+                            tooltips_info_lines.push(Line::from(Span::styled({
+                                                                                if shs_favor_low == false {
+                                                                                    within = 1;
+                                                                                    "NOT SUGGESTED VALUE"
+                                                                                } else {
+                                                                                    "SUGGESTED VALUE"
+                                                                                }
+                                                                            },
+                                                                             Style::default()
+                                                                                .fg(if within == 0 {
+                                                                                    colors["lightgreen"]
+                                                                                } else if within == 1 {
+                                                                                    colors["yellow"]
+                                                                                } else {
+                                                                                    colors["red"]
+                                                                                }))))
+                        }
+                    } else {
+                        if UI_IDS_W_DIRECTION.contains(&selected) {
                             tooltips_info_lines.push(Line::from(""));
                             let mut within = 0;
-                            if UI_IDS_W_DIRECTION.contains(&selected) {
-                                tooltips_info_lines.push(Line::from(Span::styled({
-                                                                                    if selected == LSB_UI[2] {
-                                                                                        if vol_filter < 0.003 {
-                                                                                            if vol_filter.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if vol_filter > 0.03 {
-                                                                                            if vol_filter.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == LSB_UI[4] {
-                                                                                        if vol_steepness < 2 {
-                                                                                            if vol_steepness.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if vol_steepness > 4 {
-                                                                                            if vol_steepness.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_SHS_UI[0] {
-                                                                                        if shs_num_harmonics < 3 {
-                                                                                            if shs_num_harmonics.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if shs_num_harmonics > 8 {
-                                                                                            if shs_num_harmonics.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_SHS_UI[1] {
-                                                                                        if shs_harmonic_decay < 0.7 {
-                                                                                            if shs_harmonic_decay.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if shs_harmonic_decay > 0.9 {
-                                                                                            if shs_harmonic_decay.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_SHS_UI[2] {
-                                                                                        if shs_comp_turn_point < 10.0 {
-                                                                                            if shs_comp_turn_point.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if shs_comp_turn_point > 1000.0 {
-                                                                                            if shs_comp_turn_point.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_SHS_UI[4] {
-                                                                                        if shs_peak_threshold < 0.8 {
-                                                                                            if shs_peak_threshold.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if shs_peak_threshold > 0.95 {
-                                                                                            if shs_peak_threshold.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_TWM_UI[0] {
-                                                                                        if twm_predicted_harms < 8 {
-                                                                                            if twm_predicted_harms.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if twm_predicted_harms > 15 {
-                                                                                            if twm_predicted_harms.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_TWM_UI[1] {
-                                                                                        if twm_measured_peaks < 8 {
-                                                                                            if twm_measured_peaks.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if twm_measured_peaks > 15 {
-                                                                                            if twm_measured_peaks.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_TWM_UI[2] {
-                                                                                        if twm_freq_penalty < 0.25 {
-                                                                                            if twm_freq_penalty.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if twm_freq_penalty > 0.75 {
-                                                                                            if twm_freq_penalty.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_TWM_UI[3] {
-                                                                                        if twm_amp_weight < 0.05 {
-                                                                                            if twm_amp_weight.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if twm_amp_weight > 0.2 {
-                                                                                            if twm_amp_weight.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_TWM_UI[4] {
-                                                                                        if twm_freq_weight < 0.2 {
-                                                                                            if twm_freq_weight.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if twm_freq_weight > 0.8 {
-                                                                                            if twm_freq_weight.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
-                                                                                    } else if selected == RSB_TWM_UI[5] {
-                                                                                        if twm_error_ratio < 0.2 {
-                                                                                            if twm_error_ratio.shift_down().is_ok() {
-                                                                                                within = 1;
-                                                                                                "BELOW SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MINIMUM"
-                                                                                            }
-                                                                                        } else if twm_error_ratio > 0.6 {
-                                                                                            if twm_error_ratio.shift_up().is_ok() {
-                                                                                                within = 1;
-                                                                                                "ABOVE SUGGESTED RANGE"
-                                                                                            } else {
-                                                                                                within = 2;
-                                                                                                "AT MAXIMUM"
-                                                                                            }
-                                                                                        } else {
-                                                                                            "WITHIN SUGGESTED RANGE"
-                                                                                        }
+
+                            tooltips_info_lines.push(Line::from(Span::styled({
+                                                                                if selected == LSB_UI[0] {
+                                                                                    if min_freq.shift_down_bounded(min_pos_freq).is_err() {
+                                                                                        within = 2;
+                                                                                        "AT MINIMUM"
+                                                                                    } else if min_freq.shift_up_bounded(max_freq_bound).is_err() {
+                                                                                        within = 2;
+                                                                                        "AT MAXIMUM"
                                                                                     } else {
-                                                                                        ""
+                                                                                        "WITHIN RANGE"
                                                                                     }
-                                                                                },
-                                                                                 Style::default()
-                                                                                    .fg(if within == 0 {
-                                                                                        colors["green"]
-                                                                                    } else if within == 1 {
-                                                                                        colors["yellow"]
+                                                                                } else if selected == LSB_UI[1] {
+                                                                                    if max_freq.shift_down_bounded(min_freq_bound).is_err() {
+                                                                                        within = 2;
+                                                                                        "AT MINIMUM"
+                                                                                    } else if max_freq.shift_up_bounded(max_pos_freq).is_err() {
+                                                                                        within = 2;
+                                                                                        "AT MAXIMUM"
                                                                                     } else {
-                                                                                        colors["red"]
-                                                                                    }))))
+                                                                                        "WITHIN RANGE"
+                                                                                    }
+                                                                                } else {
+                                                                                    ""
+                                                                                }
+                                                                            },
+                                                                             Style::default()
+                                                                                .fg(if within == 0 {
+                                                                                    colors["lightgreen"]
+                                                                                } else if within == 1 {
+                                                                                    colors["yellow"]
+                                                                                } else {
+                                                                                    colors["red"]
+                                                                                }))))
+                        }
+                    } // Suggested Range & Range Errors
+                } // Modification
+
+                let tooltip_info_width = tooltips_info_lines.iter().map(|line| line.width()).max().unwrap() as u16;
+
+                let [_tooltips_spacer1, tooltips_info_horizontal, _tooltips_spacer2, tooltips_seperator_area, _tooltips_spacer3, tooltips_desc_horizontal, _tooltips_spacer4] = {
+                    Layout::horizontal([
+                        Constraint::Length(2),
+                        Constraint::Length(tooltip_info_width),
+                        Constraint::Length(2),
+                        Constraint::Length(2),
+                        Constraint::Length(2),
+                        Constraint::Fill(1),
+                        Constraint::Length(2),
+                    ]).flex(Flex::Center)
+                        .areas(tooltips_content_area)
+                };
+
+                let tooltips_info_widget = Paragraph::new(tooltips_info_lines);
+                let tooltips_info_height = tooltips_info_widget.line_count(tooltip_info_width);
+
+                let [tooltips_info_area] = {
+                    Layout::vertical([
+                        Constraint::Length(tooltips_info_height as u16)
+                    ]).flex(Flex::Center)
+                        .areas(tooltips_info_horizontal)
+                };
+
+                // Tooltips Separator
+                let tooltips_seperator_widget = {
+                    Paragraph::new((0..tooltips_height-2).map(|_| Line::from(Span::styled("┃┃",
+                                                                                          Style::default()
+                                                                                              .fg(colors["blue"])
+                                                                                              .bg(colors["green"])))).collect::<Vec<_>>())
+                };
+
+                // Tooltips Description
+                let tooltips_desc_widget = Paragraph::new({
+                    if selected == LSB_UI[0] {
+                        vec![
+                            Line::from("The minimum frequency that will be detected"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Decreases the range of notes that will be detected, and can marginally decrease resource usage")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Increases the range of notes that will be detected, and can marginally increase resource usage")]),
+                            Line::from(vec![Span::styled("General Rule of Thumb: ", Style::default().fg(colors["yellow"])),
+                                            Span::from("Should be a few semitones lower than the lowest expected note in the input (if possible)")])
+                        ]
+                    } else if selected == LSB_UI[1] {
+                        vec![
+                            Line::from("The maximum frequency that will be detected"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Increases the range of notes that will be detected, good for instruments with higher fundamentals & harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Decreases the range of notes that will be detected, good for instruments with lower fundamentals & harmonics")]),
+                            Line::from(vec![Span::styled("General Rule of Thumb: ", Style::default().fg(colors["yellow"])),
+                                            Span::from("Should be around 2 octaves higher than the highest expected note in the input (if possible)")])
+                        ]
+                    } else if selected == LSB_UI[2] {
+                        vec![
+                            Line::from("The the loudest frequency must exceed this number before pitch is detected"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Blocks pitch detection of quieter sounds, but also blocks noise from being detected")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Allows pitch detection of quieter sounds, but allows noise to also be detected")]),
+                        ]
+                    } else if selected == LSB_UI[3] {
+                        vec![
+                            Line::from("How fast the volume display scales"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Decreases the precision of displaying volumes close to Volume Filter, but makes volumes outside of that range scale more slowly and therefore easier to read")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Increases the precision of displaying volumes close to Volume Filter, but makes volumes outside of that range quickly scale to zero or one and therefore harder to read")]),
+                        ]
+                    } else if selected == LSB_UI[4] {
+                        let mut ret = vec![
+                            Line::from("The algorithm used to detect the pitch"),
+                        ];
+                        ret.extend({
+                            if detect_mode == 0 {
+                                vec![Line::from(vec![Span::styled("Sub-Harmonic Summing: ", Style::default().fg(colors["lightgreen"])),
+                                                     Span::from("Good for Low- and Mid-Range instruments and voices, like bass guitars, double basses, tubas, or bassoons")]),
+                                     Line::from(vec![Span::styled("- Explanation: ", Style::default().fg(colors["yellow"])),
+                                                     Span::from("Looks through all the harmonics for each frequency and adds how loud they are together to see how much harmonic energy each frequency has. The frequency with the highest harmonic energy is most likely to be the fundamental, but it is susceptible to high-frequency noise which can cause it to pick a note an octave above the actual fundamental")]),
+                                ]
+                            } else if detect_mode == 1 {
+                                vec![Line::from(vec![Span::styled("Peak Picking: ", Style::default().fg(colors["lightgreen"])),
+                                                     Span::from("Good for instruments without complex harmonics, like flutes, recorders, or simple sine/triangle wave synthesizers")]),
+                                     Line::from(vec![Span::styled("- Explanation: ", Style::default().fg(colors["yellow"])),
+                                                     Span::from("Picks the loudest (peak) frequency")])
+                                ]
+                            } else if detect_mode == 2 {
+                                vec![Line::from(vec![Span::styled("Two-Way Mismatch: ", Style::default().fg(colors["lightgreen"])),
+                                                     Span::from("Good for instruments with complex, non-ideal harmonics or inharmonicity, like violins, violas, acoustic guitars, oboes, or saxophones")]),
+                                     Line::from(vec![Span::styled("Explanation: ", Style::default().fg(colors["yellow"])),
+                                                     Span::from("Measures some actual peaks from the input, then for each frequency it predicts some harmonics above it, and then calculates two errors for each harmonic: Predicted-to-Measured, and Measured-to-Predicted. Predicted-to-Measured takes each predicted harmonic and measures the distance to the closest actual peak, and Measured-to-Predicted takes each actual peak and measures the distance to the closest predicted harmonic. The errors are added up for each frequency, and the frequency with the lowest error is likely to be the fundamental")])
+                                ]
                             } else {
-                                tooltips_info_lines.push(Line::from(Span::styled({
-                                                                                    if shs_favor_low == false {
-                                                                                        within = 1;
-                                                                                        "NOT SUGGESTED VALUE"
-                                                                                    } else {
-                                                                                        "SUGGESTED VALUE"
-                                                                                    }
-                                                                                },
-                                                                                 Style::default()
-                                                                                    .fg(if within == 0 {
-                                                                                        colors["green"]
-                                                                                    } else if within == 1 {
-                                                                                        colors["yellow"]
-                                                                                    } else {
-                                                                                        colors["red"]
-                                                                                    }))))
+                                vec![]
                             }
-                        } else {
-                            if UI_IDS_W_DIRECTION.contains(&selected) {
-                                tooltips_info_lines.push(Line::from(""));
-                                let mut within = 0;
+                        });
 
-                                tooltips_info_lines.push(Line::from(Span::styled({
-                                                                                    if selected == LSB_UI[0] {
-                                                                                        if min_freq.shift_down_bounded(min_pos_freq).is_err() {
-                                                                                            within = 2;
-                                                                                            "AT MINIMUM"
-                                                                                        } else if min_freq.shift_up_bounded(max_freq_bound).is_err() {
-                                                                                            within = 2;
-                                                                                            "AT MAXIMUM"
-                                                                                        } else {
-                                                                                            "WITHIN RANGE"
-                                                                                        }
-                                                                                    } else if selected == LSB_UI[1] {
-                                                                                        if max_freq.shift_down_bounded(min_freq_bound).is_err() {
-                                                                                            within = 2;
-                                                                                            "AT MINIMUM"
-                                                                                        } else if max_freq.shift_up_bounded(max_pos_freq).is_err() {
-                                                                                            within = 2;
-                                                                                            "AT MAXIMUM"
-                                                                                        } else {
-                                                                                            "WITHIN RANGE"
-                                                                                        }
-                                                                                    } else {
-                                                                                        ""
-                                                                                    }
-                                                                                },
-                                                                                 Style::default()
-                                                                                    .fg(if within == 0 {
-                                                                                        colors["green"]
-                                                                                    } else if within == 1 {
-                                                                                        colors["yellow"]
-                                                                                    } else {
-                                                                                        colors["red"]
-                                                                                    }))))
-                            }
-                        } // Suggested Range & Range Errors
-                    } // Modification
+                        ret
+                    } else if selected == PITCH_DISPLAY_UI[0] {
+                        vec![
+                            Line::from("The currently detected pitch (or None if no pitch is currently detected or the volume falls below Volume Filter)"),
+                        ]
+                    } else if selected == VOL_DISPLAY_UI[0] {
+                        vec![
+                            Line::from("The current input volume, scaled by Volume Filter (Volume Filter is in the middle, and any green is above Volume Filter) and Volume Steepness"),
+                        ]
+                    } else if selected == RSB_SHS_UI[0] {
+                        vec![
+                            Line::from("The number of harmonics to check for each frequency"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Improves detection for instruments with a rich timbre and lots of high harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Reduces high frequency noise interference in output")]),
+                        ]
+                    } else if selected == RSB_SHS_UI[1] {
+                        vec![
+                            Line::from("How heavily higher harmonics are weighted"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Improves detection for instruments with a rich timbre and lots of high harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Reduces high frequency noise interference in output")]),
+                        ]
+                    } else if selected == RSB_SHS_UI[2] {
+                        vec![
+                            Line::from("Reduces range in volumes of the input"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Boosts quieter harmonics and fundamentals, good for input with complex harmonics and quieter fundamentals")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Emphasizes dominant frequencies, good for input with strong fundamentals")]),
+                        ]
+                    } else if selected == RSB_SHS_UI[3] {
+                        vec![
+                            Line::from("Favors lower fundamentals, good for input with strong high harmonics and less prominent fundamentals"),
+                        ]
+                    } else if selected == RSB_SHS_UI[4] {
+                        vec![
+                            Line::from("The energy threshold, relative to the peak, for a frequency to be considered a candidate (has no effect if Favor Low Frequencies is No)"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Only chooses candidates with energies close to the highest one, good for input with higher fundamentals")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Allows candidates with lower relative energies, good for input with lower fundamentals")]),
+                        ]
+                    } else if selected == RSB_TWM_UI[0] {
+                        vec![
+                            Line::from("The number of predicted harmonics to expect"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Enforces a longer harmonic structure, good for input with prominent harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Only enforces a shorter harmonic structure, good for input with less prominent harmonics")]),
+                        ]
+                    } else if selected == RSB_TWM_UI[1] {
+                        vec![
+                            Line::from("The number of actual peaks to measure"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Doesn't penalize quieter harmonics but expects more harmonics to be present, good for input with more & quieter harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Penalizes quieter frequencies but doesn't expect as many harmonics to be present, good for input with fewer & louder harmonics")]),
+                        ]
+                    } else if selected == RSB_TWM_UI[2] {
+                        vec![
+                            Line::from("Penalizes higher frequency matches, due to lower resolution of frequencies that high"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Penalizes higher frequencies more, good for input with primarily low harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Penalizes higher frequencies less, good for input with a broad range of or primarily high harmonics")]),
+                        ]
+                    } else if selected == RSB_TWM_UI[3] {
+                        vec![
+                            Line::from("Weights each match based on how loud the relevant measured peak is"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Decreases the weight of quiet harmonics, good for input with generally louder harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Increases the weight of quiet harmonics, good for input with generally quieter harmonics")]),
+                        ]
+                    } else if selected == RSB_TWM_UI[4] {
+                        vec![
+                            Line::from("Weights each match based on how relatively different the frequencies are"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Increases the weight of frequency mismatches, good for input with generally more predictable harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Decreases the weight of frequency mismatches, good for input with generally less predictable harmonics")]),
+                        ]
+                    } else if selected == RSB_TWM_UI[5] {
+                        vec![
+                            Line::from("Weights the two types of error (Predicted-to-Measured & Measured-to-Predicted) in the final error calculation"),
+                            Line::from(vec![Span::styled("Increasing it: ", Style::default().fg(colors["lightgreen"])),
+                                            Span::from("Increases the weight of Predicted-to-Measured errors, good for input with generally less predictable harmonics when combined with a higher Number of Measured Peaks and a lower Number of Predicted Harmonics")]),
+                            Line::from(vec![Span::styled("Decreasing it: ", Style::default().fg(colors["red"])),
+                                            Span::from("Increases the weight of Measured-to-Predicted errors, good for input with generally more predictable harmonics when combined with a higher Number of Predicted Harmonics and a lower Number of Measured Peaks")]),
+                        ]
+                    } else {
+                        vec![]
+                    }
+                }).wrap(Wrap{trim: true});
 
-                    let tooltip_info_width = tooltips_info_lines.iter().map(|line| line.width()).max().unwrap() as u16;
+                let tooltips_desc_height = tooltips_desc_widget.line_count(tooltips_desc_horizontal.width);
+                let [tooltips_desc_area] = {
+                    Layout::vertical([
+                        Constraint::Length(tooltips_desc_height as u16)
+                    ]).flex(Flex::Center)
+                        .areas(tooltips_desc_horizontal)
+                };
 
-                    let [_tooltips_spacer1, tooltips_info_horizontal, _tooltips_spacer2, tooltips_seperator_area, _tooltips_spacer3, tooltips_desc_horizontal, _tooltips_spacer4] = {
-                        Layout::horizontal([
-                            Constraint::Length(2),
-                            Constraint::Length(tooltip_info_width),
-                            Constraint::Length(2),
-                            Constraint::Length(2),
-                            Constraint::Length(2),
-                            Constraint::Fill(1),
-                            Constraint::Length(2),
-                        ]).flex(Flex::Center)
-                            .areas(tooltips_content_area)
-                    };
+                frame.render_widget(tooltips_block1, tooltips_area);
+                frame.render_widget(tooltips_block2, tooltips_block2_area);
 
-                    let tooltips_info_widget = Paragraph::new(tooltips_info_lines);
-                    let tooltips_info_height = tooltips_info_widget.line_count(tooltip_info_width);
-
-                    let [tooltips_info_area] = {
-                        Layout::vertical([
-                            Constraint::Length(tooltips_info_height as u16)
-                        ]).flex(Flex::Center)
-                            .areas(tooltips_info_horizontal)
-                    };
-
-                    let tooltips_seperator_widget = {
-                        Paragraph::new((0..tooltips_height-2).map(|_| Line::from(Span::styled("┃┃",
-                                                                                              Style::default()
-                                                                                                  .fg(colors["blue"])
-                                                                                                  .bg(colors["green"])))).collect::<Vec<_>>())
-                    };
-
-
-                    frame.render_widget(tooltips_block1, tooltips_area);
-                    frame.render_widget(tooltips_block2, tooltips_block2_area);
-
-                    frame.render_widget(tooltips_info_widget, tooltips_info_area);
-                    frame.render_widget(tooltips_seperator_widget, tooltips_seperator_area);
-                }
+                frame.render_widget(tooltips_info_widget, tooltips_info_area);
+                frame.render_widget(tooltips_seperator_widget, tooltips_seperator_area);
+                frame.render_widget(tooltips_desc_widget, tooltips_desc_area);
             }
         })?;
 
         thread::sleep(Duration::from_millis(16));
 
         while event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? && key.kind == KeyEventKind::Press {
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
                 match key.code {
                     KeyCode::Up => {
                         if selected == LSB_UI[0] {
@@ -1920,11 +2082,11 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                                 vol_filter.set(new_vol_filter);
                             }
                         } else if selected == LSB_UI[3] {
-                            detect_mode.set(detect_mode.shift_up());
-                        } else if selected == LSB_UI[4] {
                             if let Ok(new_vol_steepness) = vol_steepness.shift_up() {
                                 vol_steepness.set(new_vol_steepness);
                             }
+                        } else if selected == LSB_UI[4] {
+                            detect_mode.set(detect_mode.shift_up());
                         } else if selected == RSB_SHS_UI[0] {
                             if let Ok(new_shs_num_harmonics) = shs_num_harmonics.shift_up() {
                                 shs_num_harmonics.set(new_shs_num_harmonics);
@@ -1967,6 +2129,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                             if let Ok(new_twm_error_ratio) = twm_error_ratio.shift_up() {
                                 twm_error_ratio.set(new_twm_error_ratio);
                             }
+                        } else {
+                            let _ = 0;
                         }
                     }
                     KeyCode::Down => {
@@ -1983,11 +2147,11 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                                 vol_filter.set(new_vol_filter);
                             }
                         } else if selected == LSB_UI[3] {
-                            detect_mode.set(detect_mode.shift_down());
-                        } else if selected == LSB_UI[4] {
                             if let Ok(new_vol_steepness) = vol_steepness.shift_down() {
                                 vol_steepness.set(new_vol_steepness);
                             }
+                        } else if selected == LSB_UI[4] {
+                            detect_mode.set(detect_mode.shift_down());
                         } else if selected == RSB_SHS_UI[0] {
                             if let Ok(new_shs_num_harmonics) = shs_num_harmonics.shift_down() {
                                 shs_num_harmonics.set(new_shs_num_harmonics);
@@ -2068,7 +2232,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                             last_cursor_x = None;
                         }
                     }
-                    KeyCode::Char(' ') => {
+                    KeyCode::Backspace => {
                         if last_cursor_x.is_some() {
                             cursor_x = last_cursor_x;
                             last_cursor_x = None;
@@ -2079,6 +2243,45 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         }
                     }
                     KeyCode::Char('r') => {
+                        if selected == LSB_UI[0] {
+                            let new_min = min_freq.default();
+                            safe_audio_msg(&out_post, AudioMessage::UpdateMinFreq(new_min))?;
+                        } else if selected == LSB_UI[1] {
+                            let new_max = max_freq.default();
+                            safe_audio_msg(&out_post, AudioMessage::UpdateMaxFreq(new_max))?;
+                        } else if selected == LSB_UI[2] {
+                            vol_filter.set(vol_filter.default());
+                        } else if selected == LSB_UI[3] {
+                            vol_steepness.set(vol_steepness.default());
+                        } else if selected == LSB_UI[4] {
+                            detect_mode.set(detect_mode.default());
+                        } else if selected == RSB_SHS_UI[0] {
+                            shs_num_harmonics.set(shs_num_harmonics.default());
+                        } else if selected == RSB_SHS_UI[1] {
+                            shs_harmonic_decay.set(shs_harmonic_decay.default());
+                        } else if selected == RSB_SHS_UI[2] {
+                            shs_comp_turn_point.set(shs_comp_turn_point.default());
+                        } else if selected == RSB_SHS_UI[3] {
+                            shs_favor_low.set(shs_favor_low.default());
+                        } else if selected == RSB_SHS_UI[4] {
+                            shs_peak_threshold.set(shs_peak_threshold.default());
+                        } else if selected == RSB_TWM_UI[0] {
+                            twm_predicted_harms.set(twm_predicted_harms.default());
+                        } else if selected == RSB_TWM_UI[1] {
+                            twm_measured_peaks.set(twm_measured_peaks.default());
+                        } else if selected == RSB_TWM_UI[2] {
+                            twm_freq_penalty.set(twm_freq_penalty.default());
+                        } else if selected == RSB_TWM_UI[3] {
+                            twm_amp_weight.set(twm_amp_weight.default());
+                        } else if selected == RSB_TWM_UI[4] {
+                            twm_freq_weight.set(twm_freq_penalty.default());
+                        } else if selected == RSB_TWM_UI[5] {
+                            twm_error_ratio.set(twm_error_ratio.default());
+                        } else {
+                            let _ = 0;
+                        }
+                    }
+                    KeyCode::Char('p') => {
                         let new_min = min_freq.default();
                         let new_max = max_freq.default();
                         safe_audio_msg(&out_post, AudioMessage::UpdateBounds(new_min, new_max))?;
@@ -2116,7 +2319,9 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
     if wait {
         for msg in in_mail {
-            if let OutputMessage::Shutdown = msg { break }
+            if let OutputMessage::Shutdown = msg {
+                break;
+            }
         }
     }
 
@@ -2128,18 +2333,42 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-
-fn setup_audio_callback(min_f: f32, max_f: f32, bins_per_octave: u32, in_post: Sender<OutputMessage>, buffer_size: BufferSize) -> Result<(Device, Stream, Sender<AudioMessage>, JoinHandle<Result<(), String>>), Box<dyn error::Error>> {
+fn setup_audio_callback(
+    min_f: f32,
+    max_f: f32,
+    bins_per_octave: u32,
+    in_post: Sender<OutputMessage>,
+    buffer_size: BufferSize,
+) -> Result<
+    (
+        Device,
+        Stream,
+        Sender<AudioMessage>,
+        JoinHandle<Result<(), String>>,
+    ),
+    Box<dyn error::Error>,
+> {
     let (device, config) = device_setup()?;
 
-    let (out_post, handle) = start_process_thread(config.sample_rate() as f32, min_f, max_f, bins_per_octave, in_post)?;
+    let (out_post, handle) = start_process_thread(
+        config.sample_rate() as f32,
+        min_f,
+        max_f,
+        bins_per_octave,
+        in_post,
+    )?;
 
     let stream = setup_audio_stream(&device, config, out_post.clone(), buffer_size)?;
 
     Ok((device, stream, out_post, handle))
 }
 
-fn setup_audio_stream(device: &Device, config: SupportedStreamConfig, out_post: Sender<AudioMessage>, buffer_size: BufferSize) -> Result<Stream, Box<dyn error::Error>> {
+fn setup_audio_stream(
+    device: &Device,
+    config: SupportedStreamConfig,
+    out_post: Sender<AudioMessage>,
+    buffer_size: BufferSize,
+) -> Result<Stream, Box<dyn error::Error>> {
     //let err_fn = |err| eprintln!("An error occurred on the audio stream: {err}");
     let err_fn = |_| {};
 
@@ -2151,15 +2380,14 @@ fn setup_audio_stream(device: &Device, config: SupportedStreamConfig, out_post: 
             stream_config,
             move |data: &[f32], _| {
                 match safe_audio_msg(&out_post, AudioMessage::AudioChunk(data.to_vec())) {
-                    Ok(()) => {},
-                    Err(_desc) => { /* println!("{}", desc) */ },
+                    Ok(()) => {}
+                    Err(_desc) => { /* println!("{}", desc) */ }
                 }
-
             },
             err_fn,
             None,
         )?,
-        sform => Err(format!("Unsuported sample format: {sform}"))?
+        sform => Err(format!("Unsuported sample format: {sform}"))?,
     };
 
     Ok(stream)
@@ -2192,7 +2420,6 @@ fn normalize_disp_str(disp_str: &str) -> String {
         }
     }
     let norm_lines = norm_lines;
-
 
     let mut longest = 0;
     for line in norm_lines.lines() {
@@ -2243,12 +2470,14 @@ fn freq_to_inds(freq: f32) -> Result<(usize, usize), (bool, String)> {
                     Ok((letter_ind, octave))
                 } else {
                     Ok((last_let, last_oct))
-                }
+                };
             }
             old_diff = new_diff;
             last_oct = octave;
             last_let = letter_ind;
-            if start { start = false; }
+            if start {
+                start = false;
+            }
         }
     }
 
@@ -2282,7 +2511,10 @@ fn create_bar(level: f32, width: usize, height: usize) -> Vec<Line<'static>> {
             Color::Red
         };
 
-        lines.push(Line::from(Span::styled(new_block, Style::default().fg(color))));
+        lines.push(Line::from(Span::styled(
+            new_block,
+            Style::default().fg(color),
+        )));
     }
 
     lines
@@ -2290,7 +2522,8 @@ fn create_bar(level: f32, width: usize, height: usize) -> Vec<Line<'static>> {
 
 #[inline(always)]
 fn normalize(input: f32, midpoint: f32, curve: u16) -> f32 {
-    input.max(0.0).powf(curve as f32) / (midpoint.powf(curve as f32) + input.max(0.0).powf(curve as f32))
+    input.max(0.0).powf(curve as f32)
+        / (midpoint.powf(curve as f32) + input.max(0.0).powf(curve as f32))
 }
 
 #[inline(always)]
@@ -2300,31 +2533,50 @@ fn get_color((r, g, b): (u8, u8, u8)) -> Color {
 
 #[inline(always)]
 fn get_text_fg(selected: &str, id: &str, colors: &HashMap<&str, Color>) -> Color {
-    if selected == id {colors["green"]} else {colors["blue"]}
+    if selected == id {
+        colors["green"]
+    } else {
+        colors["blue"]
+    }
 }
 
 #[inline(always)]
 fn get_text_bg(selected: &str, id: &str, colors: &HashMap<&str, Color>) -> Color {
-    if selected == id {colors["blue"]} else {Color::Reset}
+    if selected == id {
+        colors["blue"]
+    } else {
+        Color::Reset
+    }
 }
 
 #[inline(always)]
 fn get_border_fg(selected: &str, id: &str, colors: &HashMap<&str, Color>) -> Color {
-    if selected == id {colors["lightgreen"]} else {colors["blue"]}
+    if selected == id {
+        colors["lightgreen"]
+    } else {
+        colors["blue"]
+    }
 }
 
 #[inline(always)]
 fn get_border_bg(selected: &str, id: &str, colors: &HashMap<&str, Color>) -> Color {
-    if selected == id {colors["darkblue"]} else {colors["green"]}
+    if selected == id {
+        colors["darkblue"]
+    } else {
+        colors["green"]
+    }
 }
 
-fn get_bounds_repr<T>(lower: Bound<T>, upper: Bound<T>) -> String where T: Display {
+fn get_bounds_repr<T>(lower: Bound<T>, upper: Bound<T>) -> String
+where
+    T: Display,
+{
     let lower_str = match lower {
         Bound::Included(num) => format!("[{num}"),
         Bound::Excluded(num) => format!("({num}"),
         Bound::Unbounded => String::from("(∞"),
     };
-    let upper_str =  match upper {
+    let upper_str = match upper {
         Bound::Included(num) => format!("{num}]"),
         Bound::Excluded(num) => format!("{num})"),
         Bound::Unbounded => String::from("∞)"),

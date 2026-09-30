@@ -1,13 +1,12 @@
-use std::cmp::{Ordering};
+use num_traits::Num;
+use std::cmp::Ordering;
 use std::collections::Bound;
 use std::ops::RangeBounds;
-use num_traits::Num;
 
-trait CheckBounds<T> where T: PartialOrd {
-    fn check_bounds(&self, val: T) -> bool;
-}
-
-pub trait Parameter<T>: PartialOrd<T> + PartialEq<T> where T: PartialOrd + PartialEq {
+pub trait Parameter<T>: PartialOrd<T> + PartialEq<T>
+where
+    T: PartialOrd + PartialEq,
+{
     fn shift_up(&self) -> T;
     fn shift_down(&self) -> T;
     fn set(&mut self, val: T);
@@ -51,30 +50,41 @@ pub trait ParamType: Copy + Num + PartialOrd {}
 
 impl<T> ParamType for T where T: Copy + Num + PartialOrd {}
 
-
-pub struct LinearParam<T> where T: ParamType {
+pub struct LinearParam<T>
+where
+    T: ParamType,
+{
     default: T,
     current: T,
     shift: T,
 }
 
-impl<T> LinearParam<T> where T: ParamType {
+impl<T> LinearParam<T>
+where
+    T: ParamType,
+{
     pub fn new(val: T, shift: T) -> Self {
         Self {
             default: val,
             current: val,
-            shift
+            shift,
         }
     }
 }
 
-impl<T> PartialEq<T> for LinearParam<T> where T: ParamType {
+impl<T> PartialEq<T> for LinearParam<T>
+where
+    T: ParamType,
+{
     fn eq(&self, other: &T) -> bool {
         self.current == *other
     }
 }
 
-impl<T> PartialOrd<T> for LinearParam<T> where T: ParamType {
+impl<T> PartialOrd<T> for LinearParam<T>
+where
+    T: ParamType,
+{
     fn partial_cmp(&self, other: &T) -> Option<Ordering> {
         if self.current == *other {
             Some(Ordering::Equal)
@@ -98,7 +108,10 @@ impl<T> PartialOrd<T> for LinearParam<T> where T: ParamType {
     }
 }
 
-impl<T> Parameter<T> for LinearParam<T> where T: ParamType {
+impl<T> Parameter<T> for LinearParam<T>
+where
+    T: ParamType,
+{
     fn shift_up(&self) -> T {
         self.current + self.shift
     }
@@ -116,30 +129,41 @@ impl<T> Parameter<T> for LinearParam<T> where T: ParamType {
     }
 }
 
-
-pub struct ExponentialParam<T> where T: ParamType {
+pub struct ExponentialParam<T>
+where
+    T: ParamType,
+{
     default: T,
     current: T,
     shift: T,
 }
 
-impl<T> ExponentialParam<T> where T: ParamType {
+impl<T> ExponentialParam<T>
+where
+    T: ParamType,
+{
     pub fn new(val: T, shift: T) -> Self {
         Self {
             default: val,
             current: val,
-            shift
+            shift,
         }
     }
 }
 
-impl<T> PartialEq<T> for ExponentialParam<T> where T: ParamType {
+impl<T> PartialEq<T> for ExponentialParam<T>
+where
+    T: ParamType,
+{
     fn eq(&self, other: &T) -> bool {
         self.current == *other
     }
 }
 
-impl<T> PartialOrd<T> for ExponentialParam<T> where T: ParamType {
+impl<T> PartialOrd<T> for ExponentialParam<T>
+where
+    T: ParamType,
+{
     fn partial_cmp(&self, other: &T) -> Option<Ordering> {
         if self.current == *other {
             Some(Ordering::Equal)
@@ -163,7 +187,10 @@ impl<T> PartialOrd<T> for ExponentialParam<T> where T: ParamType {
     }
 }
 
-impl<T> Parameter<T> for ExponentialParam<T> where T: ParamType {
+impl<T> Parameter<T> for ExponentialParam<T>
+where
+    T: ParamType,
+{
     fn shift_up(&self) -> T {
         self.current * self.shift
     }
@@ -181,17 +208,21 @@ impl<T> Parameter<T> for ExponentialParam<T> where T: ParamType {
     }
 }
 
-
-pub struct CyclicParam<T> where T: ParamType {
+pub struct CyclicParam<T>
+where
+    T: ParamType,
+{
     default: T,
     current: T,
     shift: T,
     top: T,
     bottom: T,
-    span: T,
 }
 
-impl<T> CyclicParam<T> where T: ParamType {
+impl<T> CyclicParam<T>
+where
+    T: ParamType,
+{
     pub fn new(val: T, shift: T, top: T, bottom: T) -> Result<Self, ()> {
         if top <= bottom {
             Err(())
@@ -202,19 +233,24 @@ impl<T> CyclicParam<T> where T: ParamType {
                 shift,
                 top,
                 bottom,
-                span: top - bottom
             })
         }
     }
 }
 
-impl<T> PartialEq<T> for CyclicParam<T> where T: ParamType {
+impl<T> PartialEq<T> for CyclicParam<T>
+where
+    T: ParamType,
+{
     fn eq(&self, other: &T) -> bool {
         self.current == *other
     }
 }
 
-impl<T> PartialOrd<T> for CyclicParam<T> where T: ParamType {
+impl<T> PartialOrd<T> for CyclicParam<T>
+where
+    T: ParamType,
+{
     fn partial_cmp(&self, other: &T) -> Option<Ordering> {
         if self.current == *other {
             Some(Ordering::Equal)
@@ -238,7 +274,10 @@ impl<T> PartialOrd<T> for CyclicParam<T> where T: ParamType {
     }
 }
 
-impl<T> Parameter<T> for CyclicParam<T> where T: ParamType {
+impl<T> Parameter<T> for CyclicParam<T>
+where
+    T: ParamType,
+{
     fn shift_up(&self) -> T {
         if self.top - self.current <= self.shift {
             self.bottom + (self.shift - (self.top - self.current))
@@ -282,13 +321,13 @@ impl BoolParam {
     }
 }
 
-impl PartialEq<bool> for BoolParam where {
+impl PartialEq<bool> for BoolParam {
     fn eq(&self, other: &bool) -> bool {
         self.current == *other
     }
 }
 
-impl PartialOrd<bool> for BoolParam where {
+impl PartialOrd<bool> for BoolParam {
     fn partial_cmp(&self, other: &bool) -> Option<Ordering> {
         if self.current == *other {
             Some(Ordering::Equal)
@@ -330,29 +369,45 @@ impl Parameter<bool> for BoolParam {
     }
 }
 
-pub struct BoundedParam<C, T> where C: Parameter<T>, T: ParamType {
+pub struct BoundedParam<C, T>
+where
+    C: Parameter<T>,
+    T: ParamType,
+{
     inner: C,
     lower_bound: Bound<T>,
     upper_bound: Bound<T>,
 }
 
-impl<C, T> BoundedParam<C, T> where C: Parameter<T>, T: ParamType {
+impl<C, T> BoundedParam<C, T>
+where
+    C: Parameter<T>,
+    T: ParamType,
+{
     pub fn new(inner: C, lower_bound: Bound<T>, upper_bound: Bound<T>) -> Self {
         Self {
             inner,
             lower_bound,
-            upper_bound
+            upper_bound,
         }
     }
 }
 
-impl<C, T> PartialEq<T> for BoundedParam<C, T> where C: Parameter<T>, T: ParamType {
+impl<C, T> PartialEq<T> for BoundedParam<C, T>
+where
+    C: Parameter<T>,
+    T: ParamType,
+{
     fn eq(&self, other: &T) -> bool {
         self.get() == *other
     }
 }
 
-impl<C, T> PartialOrd<T> for BoundedParam<C, T> where C: Parameter<T>, T: ParamType {
+impl<C, T> PartialOrd<T> for BoundedParam<C, T>
+where
+    C: Parameter<T>,
+    T: ParamType,
+{
     fn partial_cmp(&self, other: &T) -> Option<Ordering> {
         if self.get() == *other {
             Some(Ordering::Equal)
@@ -376,12 +431,18 @@ impl<C, T> PartialOrd<T> for BoundedParam<C, T> where C: Parameter<T>, T: ParamT
     }
 }
 
-impl<C, T> BoundedParameter<T> for BoundedParam<C, T> where C: Parameter<T>, T: ParamType {
+impl<C, T> BoundedParameter<T> for BoundedParam<C, T>
+where
+    C: Parameter<T>,
+    T: ParamType,
+{
     fn shift_up(&self) -> Result<T, ()> {
         if (Bound::Unbounded::<T>, self.upper_bound).contains(&self.inner.shift_up()) {
             Ok(self.inner.shift_up())
         } else {
-            if let Bound::Included(num) = self.upper_bound && self.inner.get() != num {
+            if let Bound::Included(num) = self.upper_bound
+                && self.inner.get() != num
+            {
                 Ok(num)
             } else {
                 Err(())
@@ -392,7 +453,9 @@ impl<C, T> BoundedParameter<T> for BoundedParam<C, T> where C: Parameter<T>, T: 
         if (self.lower_bound, Bound::Unbounded::<T>).contains(&self.inner.shift_down()) {
             Ok(self.inner.shift_down())
         } else {
-            if let Bound::Included(num) = self.lower_bound && self.inner.get() != num {
+            if let Bound::Included(num) = self.lower_bound
+                && self.inner.get() != num
+            {
                 Ok(num)
             } else {
                 Err(())
